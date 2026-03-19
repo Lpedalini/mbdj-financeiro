@@ -346,10 +346,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
           valor: jsonVal, atualizado_em: new Date().toISOString()
         }).then(function() {
           console.log("setData: " + key + " gravado com SUCESSO no Firestore");
-        }).catch(function(e) { 
-          console.error("Firestore save error:", key, e); 
-          alert("Erro ao salvar " + key + " no Firebase: " + e.message);
-        });
+        }).catch(function(e) { console.error("Firestore save error:", key, e); });
       } else {
         console.warn("setData: " + key + " salvo apenas no cache (sem usuario logado!)");
         return Promise.resolve();
@@ -874,7 +871,7 @@ function salvarCP(editIdx) {
   var items=getData('contas_pagar');
   var rec={numero:numero,competencia:competencia,emissao:emissao,vencimento:vencimento,valor:valor,fornecedor:fornecedor,planoContas:planoContas,empresa:empresa||'BELLE DEJU',conta:conta,centroCusto:centroCusto,status:status||'Aberto',historico:historico,parcela:'1/1',valorLiquido:valor,liquidacao:status==='Liquidado'?vencimento:''};
   if(editIdx>=0){items[editIdx]=rec;}else{items.push(rec);}
-  await setData('contas_pagar',items);closeModal();pesquisarCP();
+  setData('contas_pagar',items);closeModal();pesquisarCP();
   showToast(editIdx>=0?'Título atualizado!':'Título criado!');
 }
 
@@ -937,7 +934,7 @@ async function confirmImportCP() {
   var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})-(\d{2})-(\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
   var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
   dataRows.forEach(function(r){items.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),fornecedor:r.fornecedor||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
-  setData('contas_pagar',items);closeModal();pesquisarCP();
+  await setData('contas_pagar',items);closeModal();pesquisarCP();
   showToast('✅ '+dataRows.length+' títulos importados!');
 }
 function downloadModeloCP() {
@@ -1127,7 +1124,7 @@ function salvarCR(editIdx) {
   var items=getData('contas_receber');
   var rec={numero:numero,competencia:competencia,emissao:emissao,vencimento:vencimento,valor:valor,cliente:cliente,planoContas:planoContas,empresa:empresa||'BELLE DEJU',conta:conta,centroCusto:centroCusto,documento:documento,meioPagamento:meioPagamento,status:status||'Aberto',historico:historico,parcela:'1/1',valorLiquido:valor,liquidacao:status==='Liquidado'?vencimento:''};
   if(editIdx>=0){items[editIdx]=rec;}else{items.push(rec);}
-  await setData('contas_receber',items);closeModal();pesquisarCR();
+  setData('contas_receber',items);closeModal();pesquisarCR();
   showToast(editIdx>=0?'Título atualizado!':'Título criado!');
 }
 
@@ -1205,7 +1202,7 @@ async function confirmImportCR() {
   var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})-(\d{2})-(\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
   var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
   dataRows.forEach(function(r){items.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),cliente:r.cliente||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',documento:r.documento||'',meioPagamento:r.meioPagamento||'',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
-  setData('contas_receber',items);closeModal();pesquisarCR();
+  await setData('contas_receber',items);closeModal();pesquisarCR();
   showToast('✅ '+dataRows.length+' títulos importados!');
 }
 function downloadModeloCR() {
@@ -1748,9 +1745,9 @@ async function confirmImportXML() {
     }
   });
 
-  await setData('notas_fiscais', nfeItems);
-  if(newFornecs>0) await setData('fornecedores', fornecs);
-  if(gerarCP) await setData('contas_pagar', cpItems);
+  setData('notas_fiscais', nfeItems);
+  if(newFornecs>0) setData('fornecedores', fornecs);
+  if(gerarCP) setData('contas_pagar', cpItems);
 
   closeModal();
   pesquisarNFe();
@@ -2260,7 +2257,7 @@ function doRestore(file) {
           restorePromises.push(setData(key, backup[key]));
         }
       });
-      Promise.all(restorePromises).then(function() { console.log("Restore: dados gravados no Firestore"); });
+      Promise.all(restorePromises).then(function() { console.log("Restore completo"); });
 
       setConfigItem('erp_last_backup', new Date().toISOString());
       document.getElementById('restore-input').value = '';
