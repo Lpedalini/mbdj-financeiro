@@ -342,7 +342,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       var jsonVal = JSON.stringify(val);
       _firestoreCache["erp_" + key] = jsonVal;
       if(currentUser) {
-        db.collection("usuarios").doc(currentUser.uid).collection("dados").doc(key).set({
+        db.collection("dados").doc(key).set({
           valor: jsonVal, atualizado_em: new Date().toISOString()
         }).catch(function(e) { console.error("Firestore save error:", e); });
       }
@@ -352,7 +352,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     function setConfigItem(configKey, value) {
       if(currentUser) {
         _firestoreCache[configKey] = value;
-        db.collection("usuarios").doc(currentUser.uid).collection("config").doc(configKey).set({
+        db.collection("config").doc(configKey).set({
           valor: value, atualizado_em: new Date().toISOString()
         }).catch(function(e) { console.error("Firestore config error:", e); });
       }
@@ -362,9 +362,9 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     async function loadAllDataFromFirestore() {
       if(!currentUser) return;
       try {
-        var dataSnap = await db.collection("usuarios").doc(currentUser.uid).collection("dados").get();
+        var dataSnap = await db.collection("dados").get();
         dataSnap.forEach(function(doc) { _firestoreCache["erp_" + doc.id] = doc.data().valor; });
-        var configSnap = await db.collection("usuarios").doc(currentUser.uid).collection("config").get();
+        var configSnap = await db.collection("config").get();
         configSnap.forEach(function(doc) { _firestoreCache[doc.id] = doc.data().valor; });
         _firestoreReady = true;
       } catch(e) {
@@ -376,7 +376,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     function removeDataItem(key) {
       delete _firestoreCache["erp_" + key];
       if(currentUser) {
-        db.collection("usuarios").doc(currentUser.uid).collection("dados").doc(key).delete()
+        db.collection("dados").doc(key).delete()
           .catch(function(e) { console.error("Firestore delete error:", e); });
       }
     }
