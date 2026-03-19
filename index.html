@@ -149,6 +149,26 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
   .header-lock { padding:4px 6px; font-size:10px; }
 }
 </style>
+
+  <!-- Firebase SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script>
+    var firebaseConfig = {
+      apiKey: "AIzaSyDS98hD_Z7iplSmXlmz7-A6QjBT1lG1Au0",
+      authDomain: "mbdj-financeiro.firebaseapp.com",
+      projectId: "mbdj-financeiro",
+      storageBucket: "mbdj-financeiro.firebasestorage.app",
+      messagingSenderId: "896284892472",
+      appId: "1:896284892472:web:3e3b603f69468aa25ff5cd",
+      measurementId: "G-TKZ4RBMSLQ"
+    };
+    firebase.initializeApp(firebaseConfig);
+    var auth = firebase.auth();
+    var db = firebase.firestore();
+    var currentUser = null;
+  </script>
 </head>
 <body>
 <div class="header">
@@ -174,11 +194,12 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       <button class="login-btn" onclick="doSetupPassword()">🔐 DEFINIR SENHA</button>
       <div class="login-error" id="setup-error"></div>
     </div>
-    <div id="login-form" style="display:none;">
-      <input type="password" id="login-pass" placeholder="Digite sua senha" onkeydown="if(event.key==='Enter')doLogin();">
-      <button class="login-btn" onclick="doLogin()">🔓 ENTRAR</button>
-      <div class="login-error" id="login-error"></div>
-      <div style="margin-top:15px;"><a href="#" onclick="showForgotPassword()" style="font-size:11px;color:#888;text-decoration:none;">Esqueci minha senha</a></div>
+      <div id="login-form" style="display:none;">
+        <input type="email" id="login-email" placeholder="Digite seu email" onkeydown="if(event.key==='Enter')document.getElementById('login-pass').focus();" style="width:100%;padding:12px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px;font-size:15px;box-sizing:border-box;">
+        <input type="password" id="login-pass" placeholder="Digite sua senha" onkeydown="if(event.key==='Enter')doLogin();">
+        <button class="login-btn" onclick="doLogin()">\u{1F510} ENTRAR</button>
+        <div class="login-error" id="login-error"></div>
+        <div style="margin-top:15px;"><a href="#" onclick="showForgotPassword()" style="font-size:11px;color:#888;text-decoration:none;">Esqueci minha senha</a></div>
     </div>
   </div>
 </div>
@@ -231,147 +252,134 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
 
 <script>
 // === CORE FUNCTIONS ===
-// === AUTH SYSTEM ===
-async function hashPassword(pass) {
-  var salted = pass + '_belle_deju_erp_salt_2026';
-  // Tenta Web Crypto API (SHA-256)
-  if(window.crypto && window.crypto.subtle) {
-    try {
-      var encoder = new TextEncoder();
-      var data = encoder.encode(salted);
-      var hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      var hashArray = Array.from(new Uint8Array(hashBuffer));
-      return hashArray.map(function(b){ return b.toString(16).padStart(2,'0'); }).join('');
-    } catch(e) {}
-  }
-  // Fallback: hash simples (djb2 + rotação) — menos seguro mas funcional em file://
-  var h1 = 5381, h2 = 52711;
-  for(var i = 0; i < salted.length; i++) {
-    var c = salted.charCodeAt(i);
-    h1 = ((h1 << 5) + h1 + c) >>> 0;
-    h2 = ((h2 << 5) + h2 + c) >>> 0;
-  }
-  return h1.toString(16).padStart(8,'0') + h2.toString(16).padStart(8,'0');
-}
+    // === AUTH SYSTEM (Firebase) ===
+    var _firestoreCache = {};
+    var _firestoreReady = false;
 
-function getStoredHash() {
-  return localStorage.getItem('erp_auth_hash') || '';
-}
+    function getStoredHash() { return currentUser ? "firebase_auth" : ""; }
+    function isPasswordSet() { return true; }
 
-function isPasswordSet() {
-  return !!getStoredHash();
-}
-
-function initAuth() {
-  try {
-    var loginScreen = document.getElementById('login-screen');
-    if(!isPasswordSet()) {
-      document.getElementById('login-setup').style.display = 'block';
-      document.getElementById('login-form').style.display = 'none';
-      loginScreen.style.display = 'flex';
-    } else {
-      document.getElementById('login-setup').style.display = 'none';
-      document.getElementById('login-form').style.display = 'block';
-      loginScreen.style.display = 'flex';
-      setTimeout(function(){ document.getElementById('login-pass').focus(); }, 100);
+    function initAuth() {
+      var loginScreen = document.getElementById("login-screen");
+      document.getElementById("login-setup").style.display = "none";
+      document.getElementById("login-form").style.display = "block";
+      loginScreen.style.display = "flex";
+      auth.onAuthStateChanged(function(user) {
+        if(user) {
+          currentUser = user;
+          document.querySelector(".user").textContent = "\u{1F464} " + (user.displayName || user.email);
+          loadAllDataFromFirestore().then(function() { unlockApp(); });
+        }
+      });
+      setTimeout(function(){ var el = document.getElementById("login-email"); if(el) el.focus(); }, 100);
     }
-  } catch(e) {
-    console.error('initAuth error:', e);
-    // Fallback: mostrar setup
-    document.getElementById('login-setup').style.display = 'block';
-    document.getElementById('login-screen').style.display = 'flex';
-  }
-}
 
-async function doSetupPassword() {
-  var p1 = document.getElementById('setup-pass1').value;
-  var p2 = document.getElementById('setup-pass2').value;
-  var errEl = document.getElementById('setup-error');
+    async function doSetupPassword() { showToast("Use o login com email/senha cadastrado no sistema."); }
 
-  if(p1.length < 4) {
-    errEl.textContent = 'Senha deve ter no mínimo 4 caracteres.';
-    errEl.style.display = 'block';
-    return;
-  }
-  if(p1 !== p2) {
-    errEl.textContent = 'As senhas não coincidem.';
-    errEl.style.display = 'block';
-    return;
-  }
-
-  var hash = await hashPassword(p1);
-  localStorage.setItem('erp_auth_hash', hash);
-  unlockApp();
-  showToast('🔐 Senha criada com sucesso!');
-}
-
-async function doLogin() {
-  var pass = document.getElementById('login-pass').value;
-  var errEl = document.getElementById('login-error');
-
-  if(!pass) {
-    errEl.textContent = 'Digite sua senha.';
-    errEl.style.display = 'block';
-    return;
-  }
-
-  var hash = await hashPassword(pass);
-  if(hash === getStoredHash()) {
-    unlockApp();
-  } else {
-    errEl.textContent = 'Senha incorreta.';
-    errEl.style.display = 'block';
-    document.getElementById('login-pass').value = '';
-    document.getElementById('login-pass').focus();
-    // Tremer o box
-    var box = document.getElementById('login-box');
-    box.style.animation = 'none';
-    box.offsetHeight; // force reflow
-    box.style.animation = 'shake 0.4s ease';
-  }
-}
-
-function unlockApp() {
-  document.getElementById('login-screen').style.display = 'none';
-  document.getElementById('login-pass').value = '';
-  document.getElementById('login-error').style.display = 'none';
-  initApp();
-}
-
-function lockApp() {
-  document.getElementById('login-setup').style.display = 'none';
-  document.getElementById('login-form').style.display = 'block';
-  document.getElementById('login-screen').style.display = 'flex';
-  document.getElementById('login-pass').value = '';
-  document.getElementById('login-error').style.display = 'none';
-  setTimeout(function(){ document.getElementById('login-pass').focus(); }, 100);
-}
-
-function showForgotPassword() {
-  if(confirm('⚠️ Para resetar a senha, você precisará confirmar.\n\nIsso NÃO apaga seus dados, apenas remove a senha.\n\nPara segurança, será necessário digitar "RESET" na próxima etapa.')) {
-    var code = prompt('Digite RESET para confirmar a remoção da senha:');
-    if(code && code.trim().toUpperCase() === 'RESET') {
-      localStorage.removeItem('erp_auth_hash');
-      showToast('Senha removida. Defina uma nova.');
-      document.getElementById('login-setup').style.display = 'block';
-      document.getElementById('login-form').style.display = 'none';
-      document.getElementById('setup-pass1').value = '';
-      document.getElementById('setup-pass2').value = '';
+    async function doLogin() {
+      var email = document.getElementById("login-email") ? document.getElementById("login-email").value : "";
+      var pass = document.getElementById("login-pass").value;
+      var errEl = document.getElementById("login-error");
+      if(!email) { errEl.textContent = "Digite seu email."; errEl.style.display = "block"; return; }
+      if(!pass) { errEl.textContent = "Digite sua senha."; errEl.style.display = "block"; return; }
+      try {
+        errEl.style.display = "none";
+        var cred = await auth.signInWithEmailAndPassword(email, pass);
+        currentUser = cred.user;
+        document.querySelector(".user").textContent = "\u{1F464} " + (currentUser.displayName || currentUser.email);
+        await loadAllDataFromFirestore();
+        unlockApp();
+      } catch(e) {
+        var msg = "Erro ao fazer login.";
+        if(e.code==="auth/user-not-found"||e.code==="auth/wrong-password"||e.code==="auth/invalid-credential") msg = "Email ou senha incorretos.";
+        if(e.code==="auth/invalid-email") msg = "Email inv\u00e1lido.";
+        if(e.code==="auth/too-many-requests") msg = "Muitas tentativas. Tente mais tarde.";
+        errEl.textContent = msg; errEl.style.display = "block";
+      }
     }
-  }
-}
 
-function initApp() {
-  initSeedData();
-  showSection('dashboard');
-  checkAlertasOnLoad();
-}
+    function unlockApp() {
+      document.getElementById("login-screen").style.display = "none";
+      document.getElementById("login-pass").value = "";
+      if(document.getElementById("login-email")) document.getElementById("login-email").value = "";
+      document.getElementById("login-error").style.display = "none";
+      initApp();
+    }
 
-function getData(key) {
-  try { var d = localStorage.getItem('erp_' + key); return d ? JSON.parse(d) : []; } catch(e) { return []; }
-}
-function setData(key, val) { localStorage.setItem('erp_' + key, JSON.stringify(val)); }
-var saveData = setData;
+    function lockApp() {
+      auth.signOut().then(function() {
+        currentUser = null; _firestoreCache = {}; _firestoreReady = false;
+        document.getElementById("login-setup").style.display = "none";
+        document.getElementById("login-form").style.display = "block";
+        document.getElementById("login-screen").style.display = "flex";
+        document.getElementById("login-pass").value = "";
+        if(document.getElementById("login-email")) document.getElementById("login-email").value = "";
+        document.getElementById("login-error").style.display = "none";
+        setTimeout(function(){ var el = document.getElementById("login-email"); if(el) el.focus(); }, 100);
+      });
+    }
+
+    function showForgotPassword() {
+      var email = prompt("Digite seu email cadastrado para receber o link de redefini\u00e7\u00e3o de senha:");
+      if(email) {
+        auth.sendPasswordResetEmail(email).then(function() {
+          showToast("Email de redefini\u00e7\u00e3o enviado! Verifique sua caixa de entrada.");
+        }).catch(function(e) { showToast("Erro: " + e.message, true); });
+      }
+    }
+
+    function initApp() { initSeedData(); showSection("dashboard"); checkAlertasOnLoad(); }
+
+    // === DATA FUNCTIONS (Firestore) ===
+    function getData(key) {
+      if(_firestoreCache["erp_" + key]) {
+        try { return JSON.parse(_firestoreCache["erp_" + key]); } catch(e) { return []; }
+      }
+      return [];
+    }
+
+    function setData(key, val) {
+      var jsonVal = JSON.stringify(val);
+      _firestoreCache["erp_" + key] = jsonVal;
+      if(currentUser) {
+        db.collection("usuarios").doc(currentUser.uid).collection("dados").doc(key).set({
+          valor: jsonVal, atualizado_em: new Date().toISOString()
+        }).catch(function(e) { console.error("Firestore save error:", e); });
+      }
+    }
+    var saveData = setData;
+
+    function setConfigItem(configKey, value) {
+      if(currentUser) {
+        _firestoreCache[configKey] = value;
+        db.collection("usuarios").doc(currentUser.uid).collection("config").doc(configKey).set({
+          valor: value, atualizado_em: new Date().toISOString()
+        }).catch(function(e) { console.error("Firestore config error:", e); });
+      }
+    }
+    function getConfigItem(configKey) { return _firestoreCache[configKey] || ""; }
+
+    async function loadAllDataFromFirestore() {
+      if(!currentUser) return;
+      try {
+        var dataSnap = await db.collection("usuarios").doc(currentUser.uid).collection("dados").get();
+        dataSnap.forEach(function(doc) { _firestoreCache["erp_" + doc.id] = doc.data().valor; });
+        var configSnap = await db.collection("usuarios").doc(currentUser.uid).collection("config").get();
+        configSnap.forEach(function(doc) { _firestoreCache[doc.id] = doc.data().valor; });
+        _firestoreReady = true;
+      } catch(e) {
+        console.error("Firestore load error:", e);
+        showToast("Erro ao carregar dados. Verifique sua conex\u00e3o.", true);
+      }
+    }
+
+    function removeDataItem(key) {
+      delete _firestoreCache["erp_" + key];
+      if(currentUser) {
+        db.collection("usuarios").doc(currentUser.uid).collection("dados").doc(key).delete()
+          .catch(function(e) { console.error("Firestore delete error:", e); });
+      }
+    }
 
 function showToast(msg, isError) {
   var t = document.getElementById('toast-msg');
@@ -524,13 +532,13 @@ function exportXLS(filename, headers, rows) {
 
 // === SEED DATA ===
 function initSeedData() {
-  if(!localStorage.getItem('erp_contas_bancarias') || getData('contas_bancarias').length === 0) {
+  if(getData('contas_bancarias').length === 0) {
     setData('contas_bancarias', [
       {id:'cb1', nome:'ITAU EMPRESAS', banco:'Itaú', agencia:'1234', conta:'56789-0', saldoInicial:'0', tipo:'Conta Corrente'},
       {id:'cb2', nome:'Mercado Pago', banco:'Mercado Pago', agencia:'', conta:'', saldoInicial:'0', tipo:'Conta Digital'}
     ]);
   }
-  if(!localStorage.getItem('erp_plano_contas') || getData('plano_contas').length === 0) {
+  if(getData('plano_contas').length === 0) {
     setData('plano_contas', [
       {id:'pc1', nome:'Aluguel', tipo:'A pagar', tipoDespesa:'Fixa'},
       {id:'pc2', nome:'Contabilidade', tipo:'A pagar', tipoDespesa:'Fixa'},
@@ -547,10 +555,10 @@ function initSeedData() {
       {id:'pc13', nome:'Aporte sócios SCP', tipo:'A receber', tipoDespesa:''}
     ]);
   }
-  if(!localStorage.getItem('erp_centros_custo') || getData('centros_custo').length === 0) {
+  if(getData('centros_custo').length === 0) {
     setData('centros_custo', [{id:'cc1', nome:'BELLE DEJU'}]);
   }
-  if(!localStorage.getItem('erp_fornecedores') || getData('fornecedores').length === 0) {
+  if(getData('fornecedores').length === 0) {
     setData('fornecedores', [
       {id:'f1', nome:'BLING', cnpj:'', planoContas:'Softwares e Sistemas', centroCusto:'BELLE DEJU', contaPadrao:'ITAU EMPRESAS'},
       {id:'f2', nome:'CORREIOS', cnpj:'', planoContas:'Frete', centroCusto:'BELLE DEJU', contaPadrao:'ITAU EMPRESAS'},
@@ -592,7 +600,7 @@ function renderDashboard() {
   var saldoBancos = calcSaldoAtual();
 
   // Alerta de backup no dashboard
-  var lastBk = localStorage.getItem('erp_last_backup') || '';
+  var lastBk = getConfigItem('erp_last_backup') || '';
   var backupAlert = '';
   if(!lastBk) {
     backupAlert = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:8px;padding:12px 15px;margin-bottom:15px;display:flex;justify-content:space-between;align-items:center;"><div><strong style="color:#721c24;">⚠️ Você nunca fez um backup!</strong> <span style="color:#721c24;font-size:12px;">Seus dados existem apenas neste navegador.</span></div><button onclick="showSection(\'backup\')" style="background:#dc3545;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;">FAZER BACKUP</button></div>';
@@ -2073,12 +2081,12 @@ function getBackupStats() {
   var totalSize = 0;
   BACKUP_KEYS.forEach(function(key){
     var data = getData(key);
-    var raw = localStorage.getItem('erp_'+key) || '[]';
+    var raw = _firestoreCache['erp_'+key] || '[]' || '[]';
     stats[key] = { count: data.length, bytes: raw.length * 2 }; // JS strings are UTF-16
     totalSize += raw.length * 2;
   });
   stats._totalSize = totalSize;
-  stats._lastBackup = localStorage.getItem('erp_last_backup') || '';
+  stats._lastBackup = getConfigItem('erp_last_backup') || '';
   return stats;
 }
 
@@ -2094,7 +2102,7 @@ function renderBackup() {
   // Alerta se nunca fez backup ou faz mais de 7 dias
   var alertHtml = '';
   if(!lastBk) {
-    alertHtml = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:8px;padding:15px;margin-bottom:20px;"><strong style="color:#721c24;">⚠️ Você nunca fez um backup!</strong><p style="color:#721c24;font-size:13px;margin-top:5px;">Seus dados estão salvos apenas no localStorage do Chrome. Se limpar o cache ou trocar de computador, perderá tudo. Faça um backup agora.</p></div>';
+    alertHtml = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:8px;padding:15px;margin-bottom:20px;"><strong style="color:#721c24;">⚠️ Você nunca fez um backup!</strong><p style="color:#721c24;font-size:13px;margin-top:5px;">Você ainda não fez backup dos seus dados. Faça um backup agora para segurança adicional.</p></div>';
   } else {
     var daysSince = Math.floor((Date.now() - new Date(lastBk).getTime()) / 86400000);
     if(daysSince >= 7) {
@@ -2106,7 +2114,7 @@ function renderBackup() {
 
   // Status do armazenamento
   html += '<div class="dash-section"><h4>💾 Status do Armazenamento</h4>';
-  html += '<div style="margin-bottom:15px;"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;"><span>Uso do localStorage</span><span style="color:'+usageColor+';font-weight:bold;">'+totalKB+' KB / '+limitKB+' KB ('+usagePct+'%)</span></div>';
+  html += '<div style="margin-bottom:15px;"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;"><span>Uso do armazenamento</span><span style="color:'+usageColor+';font-weight:bold;">'+totalKB+' KB / '+limitKB+' KB ('+usagePct+'%)</span></div>';
   html += '<div style="background:#e9ecef;border-radius:4px;height:8px;overflow:hidden;"><div style="background:'+usageColor+';height:100%;width:'+Math.min(usagePct,100)+'%;border-radius:4px;transition:width 0.3s;"></div></div></div>';
 
   html += '<table class="data-table"><thead><tr><th>Módulo</th><th style="text-align:right">Registros</th><th style="text-align:right">Tamanho</th></tr></thead><tbody>';
@@ -2195,7 +2203,7 @@ function doBackup() {
   a.click();
 
   // Registrar data do backup
-  localStorage.setItem('erp_last_backup', new Date().toISOString());
+  setConfigItem('erp_last_backup', new Date().toISOString());
   showToast('💾 Backup realizado com sucesso! Guarde o arquivo em local seguro.');
   // Re-render para atualizar a data
   setTimeout(function(){ renderBackup(); }, 500);
@@ -2234,7 +2242,7 @@ function doRestore(file) {
         }
       });
 
-      localStorage.setItem('erp_last_backup', new Date().toISOString());
+      setConfigItem('erp_last_backup', new Date().toISOString());
       document.getElementById('restore-input').value = '';
       showToast('✅ Backup restaurado com sucesso! '+totalRegs+' registros recuperados.');
       renderBackup();
@@ -2252,9 +2260,9 @@ function doLimparTudo() {
   if(!confirm('🔴 ÚLTIMA CHANCE!\n\nVocê fez backup antes de limpar?\n\nClique OK para apagar TUDO.')) return;
 
   BACKUP_KEYS.forEach(function(key){
-    localStorage.removeItem('erp_'+key);
+    removeDataItem(key);
   });
-  localStorage.removeItem('erp_last_backup');
+  setConfigItem('erp_last_backup', '');
 
   // Re-iniciar seed data
   initSeedData();
@@ -2316,7 +2324,7 @@ function doArchive() {
   a.download = 'arquivo_gestao_mbdj_'+dateStr+'_'+months+'m.json';
   a.click();
 
-  // 2. Remover do localStorage
+  // 2. Remover do Firestore
   var cpKeep = cpItems.filter(function(i){
     return !(i.status==='Liquidado' && (i.liquidacao||i.vencimento) <= cutoffStr);
   });
@@ -2346,34 +2354,25 @@ function showChangePassword() {
   openModal('🔑 Alterar Senha', body, null, '450px');
 }
 
-async function doChangePassword() {
-  var oldPass = document.getElementById('chg-old').value;
-  var newPass1 = document.getElementById('chg-new1').value;
-  var newPass2 = document.getElementById('chg-new2').value;
-  var errEl = document.getElementById('chg-error');
-
-  var oldHash = await hashPassword(oldPass);
-  if(oldHash !== getStoredHash()) {
-    errEl.textContent = 'Senha atual incorreta.';
-    errEl.style.display = 'block';
-    return;
-  }
-  if(newPass1.length < 4) {
-    errEl.textContent = 'Nova senha deve ter no mínimo 4 caracteres.';
-    errEl.style.display = 'block';
-    return;
-  }
-  if(newPass1 !== newPass2) {
-    errEl.textContent = 'As novas senhas não coincidem.';
-    errEl.style.display = 'block';
-    return;
-  }
-
-  var newHash = await hashPassword(newPass1);
-  localStorage.setItem('erp_auth_hash', newHash);
-  closeModal();
-  showToast('🔑 Senha alterada com sucesso!');
-}
+    async function doChangePassword() {
+      var oldPass = document.getElementById("chg-old").value;
+      var newPass1 = document.getElementById("chg-new1").value;
+      var newPass2 = document.getElementById("chg-new2").value;
+      var errEl = document.getElementById("chg-error");
+      if(newPass1.length < 4) { errEl.textContent = "Nova senha deve ter no m\u00ednimo 4 caracteres."; errEl.style.display = "block"; return; }
+      if(newPass1 !== newPass2) { errEl.textContent = "As novas senhas n\u00e3o coincidem."; errEl.style.display = "block"; return; }
+      try {
+        var credential = firebase.auth.EmailAuthProvider.credential(currentUser.email, oldPass);
+        await currentUser.reauthenticateWithCredential(credential);
+        await currentUser.updatePassword(newPass1);
+        closeModal();
+        showToast("\u{1F527} Senha alterada com sucesso!");
+      } catch(e) {
+        if(e.code==="auth/wrong-password"||e.code==="auth/invalid-credential") errEl.textContent = "Senha atual incorreta.";
+        else errEl.textContent = "Erro: " + e.message;
+        errEl.style.display = "block";
+      }
+    }
 
 
 // ============================================================
@@ -3001,7 +3000,7 @@ function renderAnalytics() {
 
   // Config email
   html += '<div class="dash-section"><h4>📧 Configuração de Alertas por Email</h4>';
-  var emailConfig = localStorage.getItem('erp_alert_email') || '';
+  var emailConfig = getConfigItem('erp_alert_email') || '';
   html += '<div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end;">';
   html += '<div><label style="font-size:11px;color:#666;">Email do gestor:</label><input type="email" id="alert-email" value="'+emailConfig+'" placeholder="lucas@empresa.com" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;font-size:12px;"></div>';
   html += '<div><label style="font-size:11px;color:#666;">Enviar alerta quando:</label><select id="alert-trigger" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;font-size:12px;"><option value="deficit">Saldo ficar negativo em 7 dias</option><option value="vencidos">Houver títulos vencidos</option><option value="ambos" selected>Ambos</option></select></div>';
@@ -3015,14 +3014,14 @@ function renderAnalytics() {
 
 function salvarConfigEmail() {
   var email = document.getElementById('alert-email').value.trim();
-  localStorage.setItem('erp_alert_email', email);
+  setConfigItem('erp_alert_email', email);
   showToast('📧 Configuração de email salva!');
 }
 
 function enviarEmailTeste() {
   var email = document.getElementById('alert-email').value.trim();
   if(!email) { showToast('Digite o email primeiro!', true); return; }
-  localStorage.setItem('erp_alert_email', email);
+  setConfigItem('erp_alert_email', email);
 
   var data = getAnalyticsData();
   var insights = gerarInsights(data);
@@ -3076,7 +3075,7 @@ function enviarEmailTeste() {
 function enviarAlertaEmail() {
   var data = getAnalyticsData();
   var insights = gerarInsights(data);
-  var email = localStorage.getItem('erp_alert_email') || '';
+  var email = getConfigItem('erp_alert_email') || '';
 
   if(!email) {
     showToast('Configure o email do gestor primeiro!', true);
@@ -3121,15 +3120,15 @@ function enviarAlertaEmail() {
 
 // Auto-check de alertas ao abrir o sistema
 function checkAlertasOnLoad() {
-  var email = localStorage.getItem('erp_alert_email');
+  var email = getConfigItem('erp_alert_email');
   if(!email) return;
   var data = getAnalyticsData();
   var alertasAlta = data.alertas.filter(function(a){ return a.gravidade==='alta'; });
   if(alertasAlta.length > 0) {
     // Verificar se já alertou hoje
-    var lastAlert = localStorage.getItem('erp_last_alert_date');
+    var lastAlert = getConfigItem('erp_last_alert_date');
     if(lastAlert === getToday()) return;
-    localStorage.setItem('erp_last_alert_date', getToday());
+    setConfigItem('erp_last_alert_date', getToday());
     setTimeout(function(){
       if(confirm('🚨 ALERTA: '+alertasAlta.length+' problema(s) detectado(s) no caixa!\n\n'+alertasAlta.map(function(a){return '• '+a.msg;}).join('\n')+'\n\nDeseja enviar o alerta por email para '+email+'?')) {
         enviarAlertaEmail();
