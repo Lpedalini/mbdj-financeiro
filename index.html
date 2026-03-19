@@ -265,7 +265,8 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       document.getElementById("login-form").style.display = "block";
       loginScreen.style.display = "flex";
       auth.onAuthStateChanged(function(user) {
-        if(user) {
+        console.log("AUTH: user=" + (user ? user.email : "null"));
+      if(user) {
           currentUser = user;
           document.querySelector(".user").textContent = "👤 " + (user.displayName || user.email);
           loadAllDataFromFirestore().then(function() { unlockApp(); });
@@ -285,11 +286,8 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       try {
         errEl.style.display = "none";
         var cred = await auth.signInWithEmailAndPassword(email, pass);
-        currentUser = cred.user;
-        document.querySelector(".user").textContent = "👤 " + (currentUser.displayName || currentUser.email);
-        await loadAllDataFromFirestore();
-        unlockApp();
-      } catch(e) {
+      // onAuthStateChanged carrega os dados e desbloqueia o app automaticamente
+        } catch(e) {
         var msg = "Erro ao fazer login.";
         if(e.code==="auth/user-not-found"||e.code==="auth/wrong-password"||e.code==="auth/invalid-credential") msg = "Email ou senha incorretos.";
         if(e.code==="auth/invalid-email") msg = "Email inv\u00e1lido.";
@@ -299,6 +297,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     }
 
     function unlockApp() {
+      console.log("unlockApp: desbloqueando app. Cache: " + Object.keys(_firestoreCache).join(", "));
       document.getElementById("login-screen").style.display = "none";
       document.getElementById("login-pass").value = "";
       if(document.getElementById("login-email")) document.getElementById("login-email").value = "";
@@ -342,9 +341,14 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       var jsonVal = JSON.stringify(val);
       _firestoreCache["erp_" + key] = jsonVal;
       if(currentUser) {
+        console.log("setData: gravando " + key + " no Firestore (" + jsonVal.length + " chars)");
         db.collection("dados").doc(key).set({
           valor: jsonVal, atualizado_em: new Date().toISOString()
-        }).catch(function(e) { console.error("Firestore save error:", e); });
+        }).then(function() {
+          console.log("setData: " + key + " gravado com SUCESSO no Firestore");
+        }).catch(function(e) { console.error("Firestore save error:", key, e); });
+      } else {
+        console.warn("setData: " + key + " salvo apenas no cache (sem usuario logado!)");
       }
     }
     var saveData = setData;
@@ -360,16 +364,26 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     function getConfigItem(configKey) { return _firestoreCache[configKey] || ""; }
 
     async function loadAllDataFromFirestore() {
-      if(!currentUser) return;
+      if(!currentUser) { console.log("loadAll: sem usuario, pulando"); return; }
+      if(window._loadingInProgress) { console.log("loadAll: ja carregando, pulando duplicata"); return; }
+      window._loadingInProgress = true;
+      console.log("loadAll: iniciando carga para " + currentUser.email);
       try {
         var dataSnap = await db.collection("dados").get();
-        dataSnap.forEach(function(doc) { _firestoreCache["erp_" + doc.id] = doc.data().valor; });
+        console.log("loadAll: " + dataSnap.size + " documentos encontrados");
+        dataSnap.forEach(function(doc) { 
+          _firestoreCache["erp_" + doc.id] = doc.data().valor;
+          console.log("loadAll: carregou erp_" + doc.id);
+        });
         var configSnap = await db.collection("config").get();
         configSnap.forEach(function(doc) { _firestoreCache[doc.id] = doc.data().valor; });
         _firestoreReady = true;
+        console.log("loadAll: completo. Cache: " + Object.keys(_firestoreCache).join(", "));
       } catch(e) {
         console.error("Firestore load error:", e);
         showToast("Erro ao carregar dados. Verifique sua conex\u00e3o.", true);
+      } finally {
+        window._loadingInProgress = false;
       }
     }
 
