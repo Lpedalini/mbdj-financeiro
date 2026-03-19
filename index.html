@@ -197,7 +197,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       <div id="login-form" style="display:none;">
         <input type="email" id="login-email" placeholder="Digite seu email" onkeydown="if(event.key==='Enter')document.getElementById('login-pass').focus();" style="width:100%;padding:12px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px;font-size:15px;box-sizing:border-box;">
         <input type="password" id="login-pass" placeholder="Digite sua senha" onkeydown="if(event.key==='Enter')doLogin();">
-        <button class="login-btn" onclick="doLogin()">\u{1F510} ENTRAR</button>
+        <button class="login-btn" onclick="doLogin()">🔐 ENTRAR</button>
         <div class="login-error" id="login-error"></div>
         <div style="margin-top:15px;"><a href="#" onclick="showForgotPassword()" style="font-size:11px;color:#888;text-decoration:none;">Esqueci minha senha</a></div>
     </div>
@@ -267,7 +267,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       auth.onAuthStateChanged(function(user) {
         if(user) {
           currentUser = user;
-          document.querySelector(".user").textContent = "\u{1F464} " + (user.displayName || user.email);
+          document.querySelector(".user").textContent = "👤 " + (user.displayName || user.email);
           loadAllDataFromFirestore().then(function() { unlockApp(); });
         }
       });
@@ -286,7 +286,7 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
         errEl.style.display = "none";
         var cred = await auth.signInWithEmailAndPassword(email, pass);
         currentUser = cred.user;
-        document.querySelector(".user").textContent = "\u{1F464} " + (currentUser.displayName || currentUser.email);
+        document.querySelector(".user").textContent = "👤 " + (currentUser.displayName || currentUser.email);
         await loadAllDataFromFirestore();
         unlockApp();
       } catch(e) {
@@ -603,7 +603,7 @@ function renderDashboard() {
   var lastBk = getConfigItem('erp_last_backup') || '';
   var backupAlert = '';
   if(!lastBk) {
-    backupAlert = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:8px;padding:12px 15px;margin-bottom:15px;display:flex;justify-content:space-between;align-items:center;"><div><strong style="color:#721c24;">⚠️ Você nunca fez um backup!</strong> <span style="color:#721c24;font-size:12px;">Seus dados existem apenas neste navegador.</span></div><button onclick="showSection(\'backup\')" style="background:#dc3545;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;">FAZER BACKUP</button></div>';
+    backupAlert = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:8px;padding:12px 15px;margin-bottom:15px;display:flex;justify-content:space-between;align-items:center;"><div><strong style="color:#721c24;">⚠️ Você nunca fez um backup!</strong> <span style="color:#721c24;font-size:12px;">Seus dados estão salvos na nuvem (Firebase).</span></div><button onclick="showSection(\'backup\')" style="background:#dc3545;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap;">FAZER BACKUP</button></div>';
   } else {
     var daysSinceBk = Math.floor((Date.now() - new Date(lastBk).getTime()) / 86400000);
     if(daysSinceBk >= 7) {
@@ -2366,7 +2366,7 @@ function showChangePassword() {
         await currentUser.reauthenticateWithCredential(credential);
         await currentUser.updatePassword(newPass1);
         closeModal();
-        showToast("\u{1F527} Senha alterada com sucesso!");
+        showToast("🔧 Senha alterada com sucesso!");
       } catch(e) {
         if(e.code==="auth/wrong-password"||e.code==="auth/invalid-credential") errEl.textContent = "Senha atual incorreta.";
         else errEl.textContent = "Erro: " + e.message;
