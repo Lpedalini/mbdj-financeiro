@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Gestão MBDJ</title>
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakahrta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg: #f1f5f9; --surface: #ffffff; --surface-2: #f8fafc;
+  --bg: #f1f5f9; --surface: #ffffff; --surface-2: #f8fafc;h
   --border: #e2e8f0; --border-light: #f1f5f9;
   --nav-bg: #0f172a; --nav-surface: #1e293b; --nav-hover: #334155; --nav-active: rgba(245,158,11,0.12);
   --accent: #f59e0b; --accent-hover: #d97706; --accent-subtle: rgba(245,158,11,0.08);
@@ -887,16 +887,31 @@ function exportarCP() {
 }
 
 function showImportCP() {
-  var body='<div style="padding:20px;"><div id="cp-upload-zone" style="border:3px dashed #1a5276;border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:#f0f7ff;" ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';" ondragleave="this.style.borderColor=\'#1a5276\';" ondrop="event.preventDefault();this.style.borderColor=\'#1a5276\';handleCPFileObj(event.dataTransfer.files[0]);" onclick="document.getElementById(\'cp-file-input\').click();"><div style="font-size:48px;margin-bottom:10px;">📁</div><div style="font-size:16px;color:#1a5276;font-weight:bold;">Clique ou arraste seu arquivo CSV aqui</div><div style="font-size:13px;color:#666;margin-top:8px;">Formatos aceitos: .csv, .txt</div><input type="file" id="cp-file-input" accept=".csv,.txt" style="display:none;" onchange="handleCPFileObj(this.files[0]);"></div><div id="cp-import-preview" style="margin-top:15px;"></div></div>';
-  openModal('📥 Importar Contas a Pagar via CSV', body, null, '900px');
+  var body='<div style="padding:20px;"><div id="cp-upload-zone" style="border:3px dashed #1a5276;border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:#f0f7ff;" ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';" ondragleave="this.style.borderColor=\'#1a5276\';" ondrop="event.preventDefault();this.style.borderColor=\'#1a5276\';handleCPFileObj(event.dataTransfer.files[0]);" onclick="document.getElementById(\'cp-file-input\').click();"><div style="font-size:48px;margin-bottom:10px;">📁</div><div style="font-size:16px;color:#1a5276;font-weight:bold;">Clique ou arraste seu arquivo CSV/Excel aqui</div><div style="font-size:13px;color:#666;margin-top:8px;">Formatos aceitos: .csv, .txt, .xlsx, .xls</div><input type="file" id="cp-file-input" accept=".csv,.txt,.xlsx,.xls" style="display:none;" onchange="handleCPFileObj(this.files[0]);"></div><div id="cp-import-preview" style="margin-top:15px;"></div></div>';
+  openModal('📥 Importar Contas a Pagar via CSV/Excel', body, null, '900px');
 }
 function handleCPFileObj(file) {
-  if(!file) return;
-  var reader=new FileReader();
-  reader.onload=function(e){parseCPCSVAndPreview(e.target.result);};
-  reader.readAsText(file,'UTF-8');
-}
-function parseCPCSVAndPreview(csvText) {
+    if(!file) return;
+    var ext = file.name.split('.').pop().toLowerCase();
+    if(ext === 'csv' || ext === 'txt') {
+      var reader=new FileReader();
+      reader.onload=function(e){parseCPCSVAndPreview(e.target.result);};
+      reader.readAsText(file,'UTF-8');
+    } else if(ext === 'xlsx' || ext === 'xls') {
+      loadSheetJS(function(){
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var wb = XLSX.read(new Uint8Array(e.target.result), {type:'array', cellDates:true});
+          var rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, defval:''});
+          var csv = rows.map(function(r){ return r.join(';'); }).join('\n');
+          parseCPCSVAndPreview(csv);
+        };
+        reader.readAsArrayBuffer(file);
+      });
+    } else {
+      alert('Formato n\u00e3o suportado. Use .csv, .txt, .xlsx ou .xls');
+    }
+    }function parseCPCSVAndPreview(csvText) {
   var lines=csvText.split(/\r?\n/).filter(function(l){return l.trim();});
   if(lines.length<2){alert('Arquivo vazio');return;}
   var firstLine=lines[0].replace(/^\uFEFF/,'');
@@ -929,13 +944,29 @@ function parseCPCSVAndPreview(csvText) {
   document.getElementById('cp-import-preview').innerHTML='<div style="max-height:300px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">'+prev+'</div><div style="margin-top:12px;text-align:center;"><button style="background:#28a745;color:white;border:none;padding:10px 30px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;" onclick="confirmImportCP()">✅ IMPORTAR '+dataRows.length+' TÍTULOS</button></div>';
 }
 async function confirmImportCP() {
-  var dataRows=window._cpImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
-  var items=getData('contas_pagar');
-  var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})-(\d{2})-(\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
-  var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
-  dataRows.forEach(function(r){items.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),fornecedor:r.fornecedor||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
-  await setData('contas_pagar',items);closeModal();pesquisarCP();
-  showToast('✅ '+dataRows.length+' títulos importados!');
+    var dataRows=window._cpImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
+    // Perguntar se deseja gravar no banco
+    var gravarBanco = confirm('Deseja gravar os ' + dataRows.length + ' lançamentos importados no banco de dados?');
+    if(!gravarBanco) { closeModal(); return; }
+    var items=getData('contas_pagar');
+    // Perguntar se deseja sobrepor ou somar aos dados existentes
+    var modo = 'somar';
+    if(items.length > 0) {
+      var escolha = confirm('Já existem ' + items.length + ' lançamentos cadastrados.\n\nClique OK para SOBREPOR (substituir todos os dados existentes pelos importados).\nClique CANCELAR para SOMAR (adicionar os importados aos existentes).');
+      if(escolha) { modo = 'sobrepor'; }
+    }
+    var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})[\-](\d{2})[\-](\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
+    var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
+    var newItems = [];
+    dataRows.forEach(function(r)
+    {newItems.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),fornecedor:r.fornecedor||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
+    if(modo === 'sobrepor') {
+      items = newItems;
+    } else {
+      items = items.concat(newItems);
+    }
+    await setData('contas_pagar',items);closeModal();pesquisarCP();
+    showToast('✅ '+dataRows.length+' títulos importados!' + (modo === 'sobrepor' ? ' (dados anteriores substituídos)' : ' (adicionados aos existentes)'));
 }
 function downloadModeloCP() {
   var bom='\uFEFF';var csv=bom+'numero;emissao;vencimento;valor;fornecedor;conta;plano_contas;centro_custo;empresa;historico;status\n10001;01/03/2026;15/03/2026;1500,00;FORNECEDOR EXEMPLO;ITAU EMPRESAS;Aluguel;BELLE DEJU;BELLE DEJU;Pagamento mensal;Aberto\n10002;05/03/2026;20/03/2026;2300,50;OUTRO FORNECEDOR;Mercado Pago;Compra de Mercadorias;BELLE DEJU;BELLE DEJU;Compra estoque;Aberto';
@@ -1140,16 +1171,31 @@ function exportarCR() {
 }
 
 function showImportCR() {
-  var body='<div style="padding:20px;"><div id="cr-upload-zone" style="border:3px dashed #1a5276;border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:#f0f7ff;" ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';" ondragleave="this.style.borderColor=\'#1a5276\';" ondrop="event.preventDefault();this.style.borderColor=\'#1a5276\';handleCRFileObj(event.dataTransfer.files[0]);" onclick="document.getElementById(\'cr-file-input\').click();"><div style="font-size:48px;margin-bottom:10px;">📁</div><div style="font-size:16px;color:#1a5276;font-weight:bold;">Clique ou arraste seu arquivo CSV aqui</div><div style="font-size:13px;color:#666;margin-top:8px;">Formatos aceitos: .csv, .txt</div><input type="file" id="cr-file-input" accept=".csv,.txt" style="display:none;" onchange="handleCRFileObj(this.files[0]);"></div><div id="cr-import-preview" style="margin-top:15px;"></div></div>';
-  openModal('📥 Importar Contas a Receber via CSV', body, null, '900px');
+  var body='<div style="padding:20px;"><div id="cr-upload-zone" style="border:3px dashed #1a5276;border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:#f0f7ff;" ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';" ondragleave="this.style.borderColor=\'#1a5276\';" ondrop="event.preventDefault();this.style.borderColor=\'#1a5276\';handleCRFileObj(event.dataTransfer.files[0]);" onclick="document.getElementById(\'cr-file-input\').click();"><div style="font-size:48px;margin-bottom:10px;">📁</div><div style="font-size:16px;color:#1a5276;font-weight:bold;">Clique ou arraste seu arquivo CSV/Excel aqui</div><div style="font-size:13px;color:#666;margin-top:8px;">Formatos aceitos: .csv, .txt, .xlsx, .xls</div><input type="file" id="cr-file-input" accept=".csv,.txt,.xlsx,.xls" style="display:none;" onchange="handleCRFileObj(this.files[0]);"></div><div id="cr-import-preview" style="margin-top:15px;"></div></div>';
+  openModal('📥 Importar Contas a Receber via CSV/Excel', body, null, '900px');
 }
 function handleCRFileObj(file) {
-  if(!file) return;
-  var reader=new FileReader();
-  reader.onload=function(e){parseCRCSVAndPreview(e.target.result);};
-  reader.readAsText(file,'UTF-8');
-}
-function parseCRCSVAndPreview(csvText) {
+    if(!file) return;
+    var ext = file.name.split('.').pop().toLowerCase();
+    if(ext === 'csv' || ext === 'txt') {
+      var reader=new FileReader();
+      reader.onload=function(e){parseCRCSVAndPreview(e.target.result);};
+      reader.readAsText(file,'UTF-8');
+    } else if(ext === 'xlsx' || ext === 'xls') {
+      loadSheetJS(function(){
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var wb = XLSX.read(new Uint8Array(e.target.result), {type:'array', cellDates:true});
+          var rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, defval:''});
+          var csv = rows.map(function(r){ return r.join(';'); }).join('\n');
+          parseCRCSVAndPreview(csv);
+        };
+        reader.readAsArrayBuffer(file);
+      });
+    } else {
+      alert('Formato n\u00e3o suportado. Use .csv, .txt, .xlsx ou .xls');
+    }
+    }function parseCRCSVAndPreview(csvText) {
   var lines=csvText.split(/\r?\n/).filter(function(l){return l.trim();});
   if(lines.length<2){alert('Arquivo vazio');return;}
   var firstLine=lines[0].replace(/^\uFEFF/,'');
@@ -1197,13 +1243,29 @@ function parseCRCSVAndPreview(csvText) {
   document.getElementById('cr-import-preview').innerHTML='<div style="max-height:300px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">'+prev+'</div>'+skipMsg+'<div style="margin-top:12px;text-align:center;"><button style="background:#28a745;color:white;border:none;padding:10px 30px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;" onclick="confirmImportCR()">✅ IMPORTAR '+dataRows.length+' TÍTULOS</button></div>';
 }
 async function confirmImportCR() {
-  var dataRows=window._crImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
-  var items=getData('contas_receber');
-  var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})-(\d{2})-(\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
-  var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
-  dataRows.forEach(function(r){items.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),cliente:r.cliente||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',documento:r.documento||'',meioPagamento:r.meioPagamento||'',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
-  await setData('contas_receber',items);closeModal();pesquisarCR();
-  showToast('✅ '+dataRows.length+' títulos importados!');
+    var dataRows=window._crImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
+    // Perguntar se deseja gravar no banco
+    var gravarBanco = confirm('Deseja gravar os ' + dataRows.length + ' lançamentos importados no banco de dados?');
+    if(!gravarBanco) { closeModal(); return; }
+    var items=getData('contas_receber');
+    // Perguntar se deseja sobrepor ou somar aos dados existentes
+    var modo = 'somar';
+    if(items.length > 0) {
+      var escolha = confirm('Já existem ' + items.length + ' lançamentos cadastrados.\n\nClique OK para SOBREPOR (substituir todos os dados existentes pelos importados).\nClique CANCELAR para SOMAR (adicionar os importados aos existentes).');
+      if(escolha) { modo = 'sobrepor'; }
+    }
+    var normDate=function(d){if(!d)return '';d=d.trim();var m=d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=d.match(/^(\d{4})[\-](\d{2})[\-](\d{2})$/);if(m)return d;var num=parseFloat(d);if(!isNaN(num)&&num>30000){var dt=new Date((num-25569)*86400*1000);return dt.toISOString().split('T')[0];}return d;};
+    var normVal=function(v){if(!v)return 'R$ 0,00';v=v.replace(/[R$\s]/g,'');if(v.includes(',')){v=v.replace(/\./g,'').replace(',','.');}var num=parseFloat(v);return isNaN(num)?'R$ 0,00':formatCurrency(num);};
+    var newItems = [];
+    dataRows.forEach(function(r)
+    {newItems.push({numero:r.numero||'',emissao:normDate(r.emissao),vencimento:normDate(r.vencimento),valor:normVal(r.valor),valorLiquido:normVal(r.valor),cliente:r.cliente||'',conta:r.conta||'',planoContas:r.planoContas||'',centroCusto:r.centroCusto||'',empresa:r.empresa||'BELLE DEJU',documento:r.documento||'',meioPagamento:r.meioPagamento||'',historico:r.historico||'',status:r.status||'Aberto',parcela:'1/1',competencia:normDate(r.emissao),liquidacao:''});});
+    if(modo === 'sobrepor') {
+      items = newItems;
+    } else {
+      items = items.concat(newItems);
+    }
+    await setData('contas_receber',items);closeModal();pesquisarCR();
+    showToast('✅ '+dataRows.length+' títulos importados!' + (modo === 'sobrepor' ? ' (dados anteriores substituídos)' : ' (adicionados aos existentes)'));
 }
 function downloadModeloCR() {
   var bom='\uFEFF';var csv=bom+'numero;emissao;vencimento;valor;cliente;conta;plano_contas;centro_custo;empresa;documento;meio_pagamento;historico;status\n1001;01/03/2026;15/03/2026;1500,00;CLIENTE EXEMPLO;ITAU EMPRESAS;Receita Vendas;BELLE DEJU;BELLE DEJU;Boleto;PIX;Venda de mercadoria;Aberto\n1002;05/03/2026;20/03/2026;2300,50;OUTRO CLIENTE;Mercado Pago;Receita Serviços;BELLE DEJU;BELLE DEJU;Nota Fiscal;Transferência Bancária;Prestação de serviço;Aberto';
