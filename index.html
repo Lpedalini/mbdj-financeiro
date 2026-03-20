@@ -1537,7 +1537,11 @@ function pesquisarNFe() {
     '</tbody></table></td></tr>';
   }).join('');
   document.getElementById('nfe-results').innerHTML='<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th style="width:30px"></th><th>Número</th><th>Série</th><th>Emissão</th><th>Fornecedor</th><th>CNPJ</th><th>Valor</th><th>Status</th><th>Chave</th><th>Ações</th></tr></thead><tbody>'+rows+'<tr style="font-weight:bold;background:#f0f0f0;"><td colspan="6" style="text-align:right">Total:</td><td style="text-align:right">'+formatCurrency(total)+'</td><td colspan="3"></td></tr></tbody></table></div>'+
-  '<div class="action-bar"><div class="left"><button class="btn-primary" onclick="criarNFe()">+ NOVA NF-e</button><button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="showImportXML()">📥 IMPORTAR XML</button></div><div class="right">'+items.length+' itens</div></div>';
+  '<div class="action-bar"><div class="left"><button class="btn-primary" onclick="criarNFe()">+ NOVA NF-e</button><button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="showImportXML()">📥 IMPORTAR XML</button>'+
+    '<span style="color:#ccc;font-size:11px;">|</span>'+
+    '<button id="btn-sync-sefaz" style="background:#1a5276;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="sincronizarSefaz()">🔄 SINCRONIZAR SEFAZ</button>'+
+    '<button style="background:#6c757d;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="showConfigSefaz()">⚙️ Config SEFAZ</button>'+
+  '</div><div class="right">'+items.length+' itens</div></div>';
 }
 function toggleNFeRow(btn,idx){var d=document.getElementById('nfe-detail-'+idx);if(d.style.display==='none'){d.style.display='';btn.textContent='▼';}else{d.style.display='none';btn.textContent='▶';}}
 function limparNFe(){document.getElementById('nfe-de').value='';document.getElementById('nfe-ate').value='';document.getElementById('nfe-status').value='Todos';document.getElementById('nfe-forn').value='';pesquisarNFe();}
@@ -4755,6 +4759,203 @@ function baixarModeloEstoqueCSV() {
 }
 
 // ============================================================
+// === INTEGRAÇÃO SEFAZ — Frontend ============================
+// ============================================================
+
+// Inicializar Firebase Functions callable
+var _sefazFunctions = null;
+function getSefazFunctions() {
+  if(!_sefazFunctions) {
+    _sefazFunctions = {
+      sincronizar: firebase.functions().httpsCallable('sincronizarSefaz'),
+      uploadCert:  firebase.functions().httpsCallable('uploadCertificado'),
+      status:      firebase.functions().httpsCallable('statusSefaz')
+    };
+  }
+  return _sefazFunctions;
+}
+
+async function sincronizarSefaz() {
+  var btn = document.getElementById('btn-sync-sefaz');
+  if(btn) { btn.disabled = true; btn.innerHTML = '⏳ Sincronizando...'; }
+
+  try {
+    // Verificar se certificado está configurado
+    var fns = getSefazFunctions();
+    var statusRes = await fns.status();
+    var st = statusRes.data;
+
+    if(!st.certificadoConfigurado) {
+      showToast('⚠️ Certificado A1 não configurado. Clique em "Config SEFAZ" para fazer upload.', true);
+      if(btn) { btn.disabled = false; btn.innerHTML = '🔄 SINCRONIZAR SEFAZ'; }
+      return;
+    }
+
+    showToast('🔄 Conectando à SEFAZ... Isso pode levar até 1 minuto.');
+
+    // Chamar Cloud Function
+    var result = await fns.sincronizar();
+    var data = result.data;
+
+    if(data.success) {
+      showToast(data.msg);
+
+      // Se importou NF-e novas, recarregar dados do Firestore e atualizar tela
+      if(data.totalNFe > 0) {
+        showToast('📥 Recarregando dados atualizados...');
+        await loadAllDataFromFirestore();
+        pesquisarNFe(); // Atualizar listagem
+      }
+    } else {
+      showToast('❌ Erro na sincronização: ' + (data.msg || 'Erro desconhecido'), true);
+    }
+
+  } catch(e) {
+    console.error('Erro sincronizarSefaz:', e);
+    var msg = e.message || 'Erro desconhecido';
+    if(msg.includes('not-found') || msg.includes('not a function')) {
+      msg = 'Cloud Functions não encontradas. Verifique se fez o deploy (firebase deploy --only functions).';
+    } else if(msg.includes('Certificado')) {
+      msg = 'Certificado A1 não configurado. Vá em Config SEFAZ para fazer upload.';
+    } else if(msg.includes('unauthenticated')) {
+      msg = 'Sessão expirada. Faça login novamente.';
+    }
+    showToast('❌ ' + msg, true);
+  } finally {
+    if(btn) { btn.disabled = false; btn.innerHTML = '🔄 SINCRONIZAR SEFAZ'; }
+  }
+}
+
+async function showConfigSefaz() {
+  var statusHtml = '<div style="padding:8px 12px;background:#f0f0f0;border-radius:6px;margin-bottom:14px;font-size:12px;color:#666;">⏳ Carregando status...</div>';
+
+  var body =
+    '<div style="padding:20px;">'+
+      // Status
+      '<div id="sefaz-status">'+statusHtml+'</div>'+
+
+      // Upload certificado
+      '<div style="border:1px solid #1a5276;border-radius:10px;overflow:hidden;margin-bottom:16px;">'+
+        '<div style="background:#1a5276;color:white;padding:10px 14px;font-size:13px;font-weight:700;">🔐 Certificado Digital A1 (e-CNPJ)</div>'+
+        '<div style="padding:16px;">'+
+          '<p style="font-size:12px;color:#666;margin-bottom:12px;">Faça upload do seu certificado <strong>.pfx</strong> e informe a senha. O certificado é armazenado de forma segura no Firebase e usado exclusivamente para comunicação com a SEFAZ.</p>'+
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">'+
+            '<div>'+
+              '<label style="font-size:11px;color:#666;font-weight:600;">Arquivo .PFX</label>'+
+              '<div id="sefaz-cert-zone" style="border:2px dashed #1a5276;border-radius:8px;padding:16px;text-align:center;cursor:pointer;background:#f0f7ff;margin-top:4px;" onclick="document.getElementById(\'sefaz-cert-input\').click();">'+
+                '<div style="font-size:28px;">📄</div>'+
+                '<div id="sefaz-cert-name" style="font-size:12px;color:#1a5276;font-weight:600;">Clique para selecionar .pfx</div>'+
+                '<input type="file" id="sefaz-cert-input" accept=".pfx,.p12" style="display:none;" onchange="onSefazCertSelected(this.files[0])">'+
+              '</div>'+
+            '</div>'+
+            '<div>'+
+              '<label style="font-size:11px;color:#666;font-weight:600;">Senha do Certificado</label>'+
+              '<input type="password" id="sefaz-cert-pass" placeholder="Digite a senha do .pfx" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:13px;margin-top:4px;">'+
+              '<div style="margin-top:12px;">'+
+                '<button onclick="uploadCertificadoSefaz()" style="background:#1a5276;color:white;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:700;width:100%;">🔐 SALVAR CERTIFICADO</button>'+
+              '</div>'+
+            '</div>'+
+          '</div>'+
+          '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:8px 12px;font-size:11px;color:#856404;">'+
+            '💡 <strong>Segurança:</strong> O certificado é armazenado criptografado no Firebase Firestore e usado exclusivamente pelo servidor (Cloud Functions) para autenticação mútua TLS com a SEFAZ. Nenhum dado transita pelo navegador do usuário.'+
+          '</div>'+
+        '</div>'+
+      '</div>'+
+
+      // Informações técnicas
+      '<div style="border:1px solid #ddd;border-radius:10px;overflow:hidden;">'+
+        '<div style="background:#f8f9fa;padding:10px 14px;font-size:13px;font-weight:700;color:#333;">ℹ️ Como funciona</div>'+
+        '<div style="padding:14px;font-size:12px;color:#555;line-height:1.7;">'+
+          '<strong>Serviço:</strong> NFeDistribuicaoDFe (Ambiente Nacional SEFAZ)<br>'+
+          '<strong>Protocolo:</strong> SOAP 1.2 com autenticação mútua TLS (certificado A1)<br>'+
+          '<strong>O que busca:</strong> Todas as NF-e destinadas ao CNPJ '+
+            '<strong>44.578.505/0001-03</strong><br>'+
+          '<strong>Processamento:</strong> A SEFAZ retorna documentos compactados (gzip) identificados por NSU (número sequencial único). O sistema guarda o último NSU processado e a cada sincronização busca apenas os novos.<br>'+
+          '<strong>Limites:</strong> Máximo ~50 documentos por chamada. Para bases grandes, clique "Sincronizar" múltiplas vezes.'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+
+  openModal('⚙️ Configuração SEFAZ — Distribuição de DF-e', body, null, '750px');
+
+  // Carregar status assíncrono
+  try {
+    var fns = getSefazFunctions();
+    var result = await fns.status();
+    var st = result.data;
+
+    var certBadge = st.certificadoConfigurado
+      ? '<span style="background:#d4edda;color:#155724;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700;">✅ Certificado configurado</span>'
+      : '<span style="background:#f8d7da;color:#721c24;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700;">❌ Certificado não encontrado</span>';
+
+    var syncInfo = st.ultimaSincronizacao
+      ? 'Última sincronização: <strong>'+formatDateBR(st.ultimaSincronizacao.substring(0,10))+'</strong> às '+st.ultimaSincronizacao.substring(11,16)+' — NSU: '+st.ultNSU
+      : 'Nenhuma sincronização realizada ainda.';
+
+    document.getElementById('sefaz-status').innerHTML =
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">'+
+        '<div style="background:#f8f9fa;border:1px solid #ddd;border-radius:8px;padding:10px 14px;flex:1;">'+
+          '<div style="font-size:10px;color:#888;text-transform:uppercase;font-weight:600;margin-bottom:4px;">Status</div>'+
+          certBadge+
+        '</div>'+
+        '<div style="background:#f8f9fa;border:1px solid #ddd;border-radius:8px;padding:10px 14px;flex:1;">'+
+          '<div style="font-size:10px;color:#888;text-transform:uppercase;font-weight:600;margin-bottom:4px;">Ambiente</div>'+
+          '<span style="font-size:13px;font-weight:600;">'+st.ambiente+'</span>'+
+        '</div>'+
+        '<div style="background:#f8f9fa;border:1px solid #ddd;border-radius:8px;padding:10px 14px;flex:2;">'+
+          '<div style="font-size:10px;color:#888;text-transform:uppercase;font-weight:600;margin-bottom:4px;">Sincronização</div>'+
+          '<span style="font-size:12px;">'+syncInfo+'</span>'+
+        '</div>'+
+      '</div>';
+  } catch(e) {
+    document.getElementById('sefaz-status').innerHTML =
+      '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#856404;">'+
+        '⚠️ Não foi possível conectar às Cloud Functions. Verifique se o deploy foi feito (<code>firebase deploy --only functions</code>).'+
+      '</div>';
+  }
+}
+
+// Variável temporária para o PFX selecionado
+var _sefazPfxBase64 = null;
+
+function onSefazCertSelected(file) {
+  if(!file) return;
+  var nameEl = document.getElementById('sefaz-cert-name');
+  if(nameEl) nameEl.textContent = '📄 ' + file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    // Converter para base64
+    var arrayBuffer = e.target.result;
+    var bytes = new Uint8Array(arrayBuffer);
+    var binary = '';
+    for(var i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    _sefazPfxBase64 = btoa(binary);
+    console.log('Certificado carregado: ' + file.name + ' (' + _sefazPfxBase64.length + ' chars base64)');
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+async function uploadCertificadoSefaz() {
+  if(!_sefazPfxBase64) { showToast('Selecione o arquivo .pfx primeiro!', true); return; }
+  var pass = document.getElementById('sefaz-cert-pass') ? document.getElementById('sefaz-cert-pass').value : '';
+  if(!pass) { showToast('Digite a senha do certificado!', true); return; }
+
+  try {
+    showToast('🔐 Enviando certificado...');
+    var fns = getSefazFunctions();
+    var result = await fns.uploadCert({ pfxBase64: _sefazPfxBase64, password: pass });
+    showToast('✅ ' + (result.data.msg || 'Certificado salvo!'));
+    _sefazPfxBase64 = null; // Limpar da memória
+    closeModal();
+  } catch(e) {
+    console.error('Erro upload certificado:', e);
+    showToast('❌ Erro ao salvar certificado: ' + (e.message || 'Erro desconhecido'), true);
+  }
+}
+
+// ============================================================
+
 </script>
 </body>
 </html>
