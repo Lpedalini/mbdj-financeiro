@@ -330,36 +330,133 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     function initApp() { initSeedData(); showSection("dashboard"); checkAlertasOnLoad(); }
 
     // === DATA FUNCTIONS (Firestore) ===
+    // === DATA LAYER v2 — com auto-chunking para Firestore ===
+    // Firestore tem limite de ~1MB por documento.
+    // Quando os dados excedem ~800KB, o sistema automaticamente
+    // divide em múltiplos documentos (chunks) e reagrupa ao carregar.
+    var _CHUNK_THRESHOLD = 800000; // 800KB — margem segura abaixo de 1MB
+    var _CHUNK_TARGET    = 500000; // 500KB por chunk
+
     function getData(key) {
-      if(_firestoreCache["erp_" + key]) {
-        try { return JSON.parse(_firestoreCache["erp_" + key]); } catch(e) { return []; }
+      var cacheKey = "erp_" + key;
+      if(_firestoreCache[cacheKey]) {
+        try { return JSON.parse(_firestoreCache[cacheKey]); } catch(e) { return []; }
       }
       return [];
     }
 
-    function setData(key, val) {
+    async function setData(key, val) {
       var jsonVal = JSON.stringify(val);
+      // Atualiza cache local imediatamente (garante que a UI reflete os dados)
       _firestoreCache["erp_" + key] = jsonVal;
-      if(currentUser) {
-        console.log("setData: gravando " + key + " no Firestore (" + jsonVal.length + " chars)");
-        return db.collection("dados").doc(key).set({
-          valor: jsonVal, atualizado_em: new Date().toISOString()
-        }).then(function() {
-          console.log("setData: " + key + " gravado com SUCESSO no Firestore");
-        }).catch(function(e) { console.error("Firestore save error:", key, e); });
-      } else {
+
+      if(!currentUser) {
         console.warn("setData: " + key + " salvo apenas no cache (sem usuario logado!)");
-        return Promise.resolve();
+        return;
+      }
+
+      var dataSize = jsonVal.length;
+      console.log("setData: " + key + " (" + (dataSize/1024).toFixed(1) + " KB)");
+
+      try {
+        // 1. Limpar chunks antigos (se existirem)
+        await _deleteOldChunks(key);
+
+        if(dataSize < _CHUNK_THRESHOLD) {
+          // --- Documento único (comportamento normal) ---
+          await db.collection("dados").doc(key).set({
+            valor: jsonVal,
+            atualizado_em: new Date().toISOString()
+          });
+          console.log("setData: " + key + " gravado OK (doc único)");
+        } else {
+          // --- Auto-chunking: dividir em múltiplos docs ---
+          var arr = Array.isArray(val) ? val : [val];
+          var chunks = [];
+          var currentChunk = [];
+          var currentSize = 0;
+
+          for(var i = 0; i < arr.length; i++) {
+            var itemJson = JSON.stringify(arr[i]);
+            if(currentSize + itemJson.length > _CHUNK_TARGET && currentChunk.length > 0) {
+              chunks.push(currentChunk);
+              currentChunk = [];
+              currentSize = 0;
+            }
+            currentChunk.push(arr[i]);
+            currentSize += itemJson.length;
+          }
+          if(currentChunk.length > 0) chunks.push(currentChunk);
+
+          console.log("setData: " + key + " dividido em " + chunks.length + " chunks (" + arr.length + " itens)");
+
+          // Salvar documento manifesto (indica que é chunked)
+          await db.collection("dados").doc(key).set({
+            _chunked: true,
+            _totalChunks: chunks.length,
+            _totalItems: arr.length,
+            atualizado_em: new Date().toISOString()
+          });
+
+          // Salvar cada chunk
+          for(var c = 0; c < chunks.length; c++) {
+            var chunkJson = JSON.stringify(chunks[c]);
+            await db.collection("dados").doc(key + "__chunk_" + c).set({
+              valor: chunkJson,
+              _parentKey: key,
+              _chunkIndex: c,
+              atualizado_em: new Date().toISOString()
+            });
+            // Guardar no cache para tracking
+            _firestoreCache["erp_" + key + "__chunk_" + c] = chunkJson;
+          }
+          console.log("setData: " + key + " gravado OK (" + chunks.length + " chunks)");
+        }
+      } catch(e) {
+        console.error("Firestore save ERRO:", key, e);
+        showToast("\u274c ERRO ao salvar " + key + " no banco de dados! Verifique o console (F12). Detalhe: " + (e.message || e.code || "desconhecido"), true);
+        // NÃO faz throw — dados ficam no cache local até próxima tentativa
       }
     }
     var saveData = setData;
+
+    async function _deleteOldChunks(key) {
+      // Apagar todos os documentos __chunk_ associados a esta key
+      var prefix = "erp_" + key + "__chunk_";
+      var chunkKeys = Object.keys(_firestoreCache).filter(function(k) { return k.startsWith(prefix); });
+
+      if(chunkKeys.length === 0) return;
+
+      console.log("setData: limpando " + chunkKeys.length + " chunks antigos de " + key);
+      var batch = db.batch();
+      chunkKeys.forEach(function(k) {
+        var docId = k.replace("erp_", "");
+        batch.delete(db.collection("dados").doc(docId));
+        delete _firestoreCache[k];
+      });
+
+      try {
+        await batch.commit();
+      } catch(e) {
+        // Se batch falhar (ex: muitos deletes), tentar um por um
+        console.warn("Batch delete falhou, tentando individual:", e);
+        for(var i = 0; i < chunkKeys.length; i++) {
+          var docId = chunkKeys[i].replace("erp_", "");
+          try { await db.collection("dados").doc(docId).delete(); } catch(e2) { /* ignore */ }
+          delete _firestoreCache[chunkKeys[i]];
+        }
+      }
+    }
 
     function setConfigItem(configKey, value) {
       if(currentUser) {
         _firestoreCache[configKey] = value;
         db.collection("config").doc(configKey).set({
           valor: value, atualizado_em: new Date().toISOString()
-        }).catch(function(e) { console.error("Firestore config error:", e); });
+        }).catch(function(e) {
+          console.error("Firestore config error:", e);
+          showToast("\u274c Erro ao salvar configura\u00e7\u00e3o: " + configKey, true);
+        });
       }
     }
     function getConfigItem(configKey) { return _firestoreCache[configKey] || ""; }
@@ -372,14 +469,52 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
       try {
         var dataSnap = await db.collection("dados").get();
         console.log("loadAll: " + dataSnap.size + " documentos encontrados");
-        dataSnap.forEach(function(doc) { 
-          _firestoreCache["erp_" + doc.id] = doc.data().valor;
-          console.log("loadAll: carregou erp_" + doc.id);
+
+        // Passo 1: carregar todos os docs no cache
+        var manifests = []; // keys que são chunked
+        dataSnap.forEach(function(doc) {
+          var data = doc.data();
+          if(data._chunked === true) {
+            // É um manifesto de dados chunked
+            manifests.push({ key: doc.id, totalChunks: data._totalChunks || 0, totalItems: data._totalItems || 0 });
+            console.log("loadAll: detectou " + doc.id + " chunked (" + data._totalChunks + " chunks, " + data._totalItems + " itens)");
+          } else if(data.valor !== undefined) {
+            // Documento normal (inclui chunks individuais)
+            _firestoreCache["erp_" + doc.id] = data.valor;
+            // Só logar docs que NÃO são chunks (para não poluir o console)
+            if(doc.id.indexOf("__chunk_") === -1) {
+              console.log("loadAll: carregou erp_" + doc.id);
+            }
+          }
         });
+
+        // Passo 2: reagrupar dados chunked
+        manifests.forEach(function(m) {
+          var allItems = [];
+          for(var i = 0; i < m.totalChunks; i++) {
+            var chunkCacheKey = "erp_" + m.key + "__chunk_" + i;
+            if(_firestoreCache[chunkCacheKey]) {
+              try {
+                var chunkArr = JSON.parse(_firestoreCache[chunkCacheKey]);
+                allItems = allItems.concat(chunkArr);
+              } catch(e) {
+                console.error("loadAll: erro ao parsear chunk " + chunkCacheKey, e);
+              }
+            } else {
+              console.warn("loadAll: chunk " + chunkCacheKey + " n\u00e3o encontrado!");
+            }
+          }
+          // Armazenar dados reagrupados sob a key principal
+          _firestoreCache["erp_" + m.key] = JSON.stringify(allItems);
+          console.log("loadAll: reagrupou " + m.key + " de " + m.totalChunks + " chunks \u2192 " + allItems.length + " itens");
+        });
+
+        // Passo 3: config
         var configSnap = await db.collection("config").get();
         configSnap.forEach(function(doc) { _firestoreCache[doc.id] = doc.data().valor; });
+
         _firestoreReady = true;
-        console.log("loadAll: completo. Cache: " + Object.keys(_firestoreCache).join(", "));
+        console.log("loadAll: completo. Keys: " + Object.keys(_firestoreCache).filter(function(k){ return k.startsWith("erp_") && k.indexOf("__chunk_")===-1; }).join(", "));
       } catch(e) {
         console.error("Firestore load error:", e);
         showToast("Erro ao carregar dados. Verifique sua conex\u00e3o.", true);
@@ -391,8 +526,11 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     function removeDataItem(key) {
       delete _firestoreCache["erp_" + key];
       if(currentUser) {
+        // Deletar documento principal
         db.collection("dados").doc(key).delete()
           .catch(function(e) { console.error("Firestore delete error:", e); });
+        // Deletar chunks associados (se existirem)
+        _deleteOldChunks(key).catch(function(e) { console.error("Chunk delete error:", e); });
       }
     }
 
