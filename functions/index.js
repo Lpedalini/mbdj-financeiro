@@ -87,6 +87,11 @@ async function callSefaz(soapBody) {
   const url = CONFIG.AMBIENTE === "1" ? CONFIG.URL_PROD : CONFIG.URL_HOMOLOG;
   const parsedUrl = new URL(url);
 
+
+    // Criar Agent com suporte a certificados PFX legados (OpenSSL 3.0 / Node 20+)
+    const tls = require("tls");
+    const sslContext = tls.createSecureContext({ pfx: certPfx, passphrase: certPass });
+    const agent = new https.Agent({ secureContext: sslContext });
   const options = {
     hostname: parsedUrl.hostname,
     port: 443,
@@ -96,11 +101,8 @@ async function callSefaz(soapBody) {
       "Content-Type": "application/soap+xml; charset=utf-8",
       "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
     },
-    pfx: certPfx,
-    passphrase: certPass,
-    rejectUnauthorized: true,
-        secureOptions: require("crypto").constants.SSL_OP_LEGACY_SERVER_CONNECT,
-  };
+    agent: agent,
+    
 
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
