@@ -7,7 +7,7 @@
  * Requer: Certificado digital e-CNPJ A1 (.pfx) armazenado no Firebase Secret Manager.
  */
 const functions = require("firebase-functions");
-const admin = require("firebase-admin");
+const admin = require("firebase-admin");h
 const https = require("https");
 const zlib = require("zlib");
 const { DOMParser } = require("@xmldom/xmldom");
@@ -195,7 +195,13 @@ function parseSefazResponse(xmlResponse) {
     try {
       // Descomprimir gzip
       const compressed = Buffer.from(base64Content, "base64");
-      const xmlContent = zlib.inflateSync(compressed).toString("utf-8");
+      // Tentar gunzip (padrão SEFAZ DFe), depois inflate, depois inflateRaw
+                let xmlContent;
+                try { xmlContent = zlib.gunzipSync(compressed).toString("utf-8"); }
+                catch (_e1) {
+                              try { xmlContent = zlib.inflateSync(compressed).toString("utf-8"); }
+                              catch (_e2) { xmlContent = zlib.inflateRawSync(compressed).toString("utf-8"); }
+                }
 
       // Parsear o XML do documento
       const nfeData = parseNFeXMLContent(xmlContent, schema);
