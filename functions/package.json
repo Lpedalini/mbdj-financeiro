@@ -1,7 +1,7 @@
 {
   "name": "mbdj-sefaz-functions",
   "description": "Cloud Functions MBDJ — Integração SEFAZ DF-e",
-  "engines": { "node": "18" },
+  "engines": { "node": "20" },
   "main": "index.js",
   "dependencies": {
     "firebase-admin": "^11.11.1",

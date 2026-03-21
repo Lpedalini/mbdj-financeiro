@@ -11,6 +11,7 @@ const admin = require("firebase-admin");
 const https = require("https");
 const zlib = require("zlib");
 const { DOMParser } = require("@xmldom/xmldom");
+const forge = require("node-forge");
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -40,11 +41,11 @@ function buildSoapDistNSU(ultNSU, cnpj, uf, ambiente) {
     <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
       <nfeDadosMsg>
         <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-          <tpAmb>\${ambiente}</tpAmb>
-          <cUFAutor>\${uf}</cUFAutor>
-          <CNPJ>\${cnpj}</CNPJ>
+          <tpAmb>${ambiente}</tpAmb>
+          <cUFAutor>${uf}</cUFAutor>
+          <CNPJ>${cnpj}</CNPJ>
           <distNSU>
-            <ultNSU>\${nsu}</ultNSU>
+            <ultNSU>${nsu}</ultNSU>
           </distNSU>
         </distDFeInt>
       </nfeDadosMsg>
@@ -63,11 +64,11 @@ function buildSoapConsChNFe(chaveNFe, cnpj, uf, ambiente) {
     <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
       <nfeDadosMsg>
         <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-          <tpAmb>\${ambiente}</tpAmb>
-          <cUFAutor>\${uf}</cUFAutor>
-          <CNPJ>\${cnpj}</CNPJ>
+          <tpAmb>${ambiente}</tpAmb>
+          <cUFAutor>${uf}</cUFAutor>
+          <CNPJ>${cnpj}</CNPJ>
           <consChNFe>
-            <chNFe>\${chaveNFe}</chNFe>
+            <chNFe>${chaveNFe}</chNFe>
           </consChNFe>
         </distDFeInt>
       </nfeDadosMsg>
@@ -88,22 +89,39 @@ async function callSefaz(soapBody) {
   const parsedUrl = new URL(url);
 
 
-    // Criar Agent com suporte a certificados PFX legados (OpenSSL 3.0 / Node 20+)
-    const tls = require("tls");
-    const sslContext = tls.createSecureContext({ pfx: certPfx, passphrase: certPass });
-    const agent = new https.Agent({ secureContext: sslContext });
-  const options = {
-    hostname: parsedUrl.hostname,
-    port: 443,
-    path: parsedUrl.pathname,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/soap+xml; charset=utf-8",
-      "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
-    },
-    agent: agent,
+    // Converter PFX para PEM usando node-forge (contorna OpenSSL 3.0 do Node 20)
+  const p12Der = forge.util.decode64(certPfx.toString('base64'));
+  const p12Asn1 = forge.asn1.fromDer(p12Der);
+  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, certPass);
+
+  // Extrair chave privada
+  const keyBags = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+  const keyBag = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag][0];
+  const privateKeyPem = forge.pki.privateKeyToPem(keyBag.key);
+
+  // Extrair certificado(s)
+  const certBags = p12.getBags({ bagType: forge.pki.oids.certBag });
+  const certs = certBags[forge.pki.oids.certBag];
+  const certPems = certs.map(c => forge.pki.certificateToPem(c.cert));
+
+    const agent = new https.Agent({
+    key: privateKeyPem,
+    cert: certPems.join('\n'),
+    rejectUnauthorized: false,
+  });
     
 
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: 443,
+      path: parsedUrl.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/soap+xml; charset=utf-8",
+        "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
+      },
+      agent: agent,
+    };
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       let data = [];
@@ -113,11 +131,11 @@ async function callSefaz(soapBody) {
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve(body);
         } else {
-          reject(new Error(`SEFAZ HTTP \${res.statusCode}: \${body.substring(0, 500)}`));
+          reject(new Error(`SEFAZ HTTP ${res.statusCode}: ${body.substring(0, 500)}`));
         }
       });
     });
-    req.on("error", (e) => reject(new Error(`SEFAZ Connection Error: \${e.message}`)));
+    req.on("error", (e) => reject(new Error(`SEFAZ Connection Error: ${e.message}`)));
     req.setTimeout(30000, () => { req.destroy(); reject(new Error("SEFAZ Timeout (30s)")); });
     req.write(soapBody);
     req.end();
@@ -214,7 +232,7 @@ function parseSefazResponse(xmlResponse) {
         result.documentos.push(nfeData);
       }
     } catch (e) {
-      console.warn(`Erro ao descomprimir docZip NSU \${nsu}:`, e.message);
+      console.warn(`Erro ao descomprimir docZip NSU ${nsu}:`, e.message);
     }
   }
 
@@ -365,14 +383,14 @@ exports.sincronizarSefaz = functions
       throw new functions.https.HttpsError("unauthenticated", "Usuário não autenticado.");
     }
 
-    console.log(`[sincronizarSefaz] Iniciado por \${context.auth.uid}`);
+    console.log(`[sincronizarSefaz] Iniciado por ${context.auth.uid}`);
 
     try {
       // Carregar último NSU processado
       const configDoc = await db.collection("config").doc("sefaz_sync").get();
       let ultNSU = configDoc.exists ? (configDoc.data().ultNSU || "0") : "0";
 
-      console.log(`[sincronizarSefaz] Último NSU: \${ultNSU}`);
+      console.log(`[sincronizarSefaz] Último NSU: ${ultNSU}`);
 
       let totalDocs = 0;
       let totalNFe = 0;
@@ -383,7 +401,7 @@ exports.sincronizarSefaz = functions
 
       while (hasMore && iterations < maxIterations) {
         iterations++;
-        console.log(`[sincronizarSefaz] Iteração \${iterations}, NSU: \${ultNSU}`);
+        console.log(`[sincronizarSefaz] Iteração ${iterations}, NSU: ${ultNSU}`);
 
         // Montar e enviar SOAP
         const soapBody = buildSoapDistNSU(ultNSU, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
@@ -391,7 +409,7 @@ exports.sincronizarSefaz = functions
 
         // Parsear resposta
         const result = parseSefazResponse(response);
-        console.log(`[sincronizarSefaz] cStat=\${result.cStat} | \${result.xMotivo} | \${result.documentos.length} docs | ultNSU=\${result.ultNSU} maxNSU=\${result.maxNSU}`);
+        console.log(`[sincronizarSefaz] cStat=${result.cStat} | ${result.xMotivo} | ${result.documentos.length} docs | ultNSU=${result.ultNSU} maxNSU=${result.maxNSU}`);
 
         if (result.cStat === "137") {
           // Nenhum documento novo
@@ -400,7 +418,7 @@ exports.sincronizarSefaz = functions
         }
 
         if (result.cStat !== "138") {
-          throw new Error(`SEFAZ retornou \${result.cStat}: \${result.xMotivo}`);
+          throw new Error(`SEFAZ retornou ${result.cStat}: ${result.xMotivo}`);
         }
 
         // Processar documentos
@@ -425,7 +443,7 @@ exports.sincronizarSefaz = functions
                   }
                 }
               } catch (e) {
-                console.warn(`Erro ao buscar NF-e chave \${doc.chave}:`, e.message);
+                console.warn(`Erro ao buscar NF-e chave ${doc.chave}:`, e.message);
                 // Salvar resumo mesmo assim
                 await salvarResumoNoFirestore(doc);
               }
@@ -459,7 +477,7 @@ exports.sincronizarSefaz = functions
         iteracoes: iterations,
         hasMore,
         msg: totalNFe > 0
-          ? `✅ \${totalNFe} NF-e(s) importada(s) da SEFAZ!`
+          ? `✅ ${totalNFe} NF-e(s) importada(s) da SEFAZ!`
           : "Nenhuma NF-e nova encontrada.",
       };
 
@@ -498,7 +516,7 @@ async function salvarNFeNoFirestore(nfe) {
 
   // Verificar se já existe
   if (nfe.chave && nfeItems.some(n => n.chave === nfe.chave)) {
-    console.log(`[salvarNFe] NF-e \${nfe.numero} (chave \${nfe.chave.substring(0, 15)}...) já existe, pulando.`);
+    console.log(`[salvarNFe] NF-e ${nfe.numero} (chave ${nfe.chave.substring(0, 15)}...) já existe, pulando.`);
     return;
   }
 
@@ -563,7 +581,7 @@ async function salvarNFeNoFirestore(nfe) {
 
     // Salvar chunks
     for (let i = 0; i < chunks.length; i++) {
-      await db.collection("dados").doc(`notas_fiscais__chunk_\${i}`).set({
+      await db.collection("dados").doc(`notas_fiscais__chunk_${i}`).set({
         valor: JSON.stringify(chunks[i]),
         _parentKey: "notas_fiscais",
         _chunkIndex: i,
@@ -572,7 +590,7 @@ async function salvarNFeNoFirestore(nfe) {
     }
   }
 
-  console.log(`[salvarNFe] NF-e \${nfe.numero} salva (total: \${nfeItems.length})`);
+  console.log(`[salvarNFe] NF-e ${nfe.numero} salva (total: ${nfeItems.length})`);
 }
 
 async function salvarResumoNoFirestore(resumo) {
@@ -611,7 +629,7 @@ exports.uploadCertificado = functions
       if (pfxBuffer.length < 100) throw new Error("Arquivo muito pequeno");
       if (pfxBuffer.length > 50000) throw new Error("Arquivo muito grande (max 50KB)");
     } catch (e) {
-      throw new functions.https.HttpsError("invalid-argument", `Certificado inválido: \${e.message}`);
+      throw new functions.https.HttpsError("invalid-argument", `Certificado inválido: ${e.message}`);
     }
 
     // Salvar no Firestore
