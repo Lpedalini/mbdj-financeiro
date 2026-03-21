@@ -7,7 +7,7 @@
  * Requer: Certificado digital e-CNPJ A1 (.pfx) armazenado no Firebase Secret Manager.
  */
 const functions = require("firebase-functions");
-const admin = require("firebase-admin");h
+const admin = require("firebase-admin");
 const https = require("https");
 const zlib = require("zlib");
 const { DOMParser } = require("@xmldom/xmldom");
