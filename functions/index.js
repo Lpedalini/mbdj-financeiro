@@ -99,6 +99,7 @@ async function callSefaz(soapBody) {
     pfx: certPfx,
     passphrase: certPass,
     rejectUnauthorized: true,
+        secureOptions: require("crypto").constants.SSL_OP_LEGACY_SERVER_CONNECT,
   };
 
   return new Promise((resolve, reject) => {
