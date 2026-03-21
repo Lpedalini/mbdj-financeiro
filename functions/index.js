@@ -1,35 +1,69 @@
 /**
  * MBDJ — Cloud Function: Consulta NF-e via SEFAZ Distribuição de DF-e
+ * v2.1 — Correções e melhorias
  * 
- * Usa o serviço NFeDistribuicaoDFe (Ambiente Nacional) para buscar
- * todas as NF-e destinadas ao CNPJ da empresa.
- * 
- * Requer: Certificado digital e-CNPJ A1 (.pfx) armazenado no Firebase Secret Manager.
+ * Changelog v2.1:
+ *   - Fix: sintaxe do objeto options em callSefaz (faltava fechar })
+ *   - Melhoria: cache do certificado em memória (evita ler Firestore a cada chamada SOAP)
+ *   - Melhoria: retry automático com backoff em caso de erro temporário da SEFAZ
+ *   - Melhoria: extração de impostos detalhados (ICMS, PIS, COFINS, IPI, ST)
+ *   - Melhoria: validação real do PFX no upload (tenta criar SecureContext)
+ *   - Melhoria: tratamento do cStat 656 (rate limit SEFAZ) sem erro
+ *   - Melhoria: retorna lista de NF-e importadas ao frontend
+ *   - Melhoria: log com duração de cada etapa
  */
+
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const https = require("https");
+const tls = require("tls");
 const zlib = require("zlib");
 const { DOMParser } = require("@xmldom/xmldom");
-const forge = require("node-forge");
 
 admin.initializeApp();
 const db = admin.firestore();
 
 // ══════════════════════════════════════════════════════════
-//  CONFIGURAÇÃO — ajustar conforme sua empresa
+//  CONFIGURAÇÃO
 // ══════════════════════════════════════════════════════════
 const CONFIG = {
-  CNPJ: "44578505000103",           // CNPJ da MBDJ (sem pontuação)
-  UF_CODIGO: "35",                   // 35 = São Paulo
-  AMBIENTE: "1",                     // 1 = Produção, 2 = Homologação
-  // Endpoints SEFAZ Ambiente Nacional
+  CNPJ: "44578505000103",
+  UF_CODIGO: "35",
+  AMBIENTE: "1",
   URL_PROD: "https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
   URL_HOMOLOG: "https://hom1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
+  MAX_ITERATIONS: 10,
+  RATE_LIMIT_MS: 1500,
+  RETRY_MAX: 2,
+  RETRY_DELAY_MS: 3000,
 };
 
 // ══════════════════════════════════════════════════════════
-//  SOAP ENVELOPE — Consulta por NSU (número sequencial único)
+//  CACHE DE CERTIFICADO EM MEMÓRIA
+// ══════════════════════════════════════════════════════════
+let _certCache = null;
+
+async function getCertificado() {
+  if (_certCache && (Date.now() - _certCache.loadedAt) < 300000) {
+    return _certCache;
+  }
+  const doc = await db.collection("config").doc("sefaz_cert").get();
+  if (!doc.exists || !doc.data().pfx_base64) {
+    throw new Error("Certificado A1 não encontrado. Faça upload em Config SEFAZ.");
+  }
+  if (!doc.data().password) {
+    throw new Error("Senha do certificado não encontrada.");
+  }
+  _certCache = {
+    pfx: Buffer.from(doc.data().pfx_base64, "base64"),
+    pass: doc.data().password,
+    loadedAt: Date.now(),
+  };
+  return _certCache;
+}
+
+// ══════════════════════════════════════════════════════════
+//  SOAP ENVELOPES
 // ══════════════════════════════════════════════════════════
 function buildSoapDistNSU(ultNSU, cnpj, uf, ambiente) {
   const nsu = String(ultNSU).padStart(15, "0");
@@ -54,7 +88,6 @@ function buildSoapDistNSU(ultNSU, cnpj, uf, ambiente) {
 </soap12:Envelope>`;
 }
 
-// Consulta por chave de acesso específica
 function buildSoapConsChNFe(chaveNFe, cnpj, uf, ambiente) {
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -78,53 +111,31 @@ function buildSoapConsChNFe(chaveNFe, cnpj, uf, ambiente) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  CHAMADA SOAP COM CERTIFICADO A1
+//  CHAMADA SOAP COM CERTIFICADO A1 + RETRY
 // ══════════════════════════════════════════════════════════
 async function callSefaz(soapBody) {
-  // Carregar certificado do Secret Manager do Firebase
-  const certPfx = await loadCertificate();
-  const certPass = await loadCertificatePassword();
-
+  const cert = await getCertificado();
   const url = CONFIG.AMBIENTE === "1" ? CONFIG.URL_PROD : CONFIG.URL_HOMOLOG;
   const parsedUrl = new URL(url);
 
+  const sslContext = tls.createSecureContext({ pfx: cert.pfx, passphrase: cert.pass });
+  const agent = new https.Agent({ secureContext: sslContext });
 
-    // Converter PFX para PEM usando node-forge (contorna OpenSSL 3.0 do Node 20)
-  const p12Der = forge.util.decode64(certPfx.toString('base64'));
-  const p12Asn1 = forge.asn1.fromDer(p12Der);
-  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, certPass);
+  const options = {
+    hostname: parsedUrl.hostname,
+    port: 443,
+    path: parsedUrl.pathname,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/soap+xml; charset=utf-8",
+      "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
+    },
+    agent: agent,
+  };
 
-  // Extrair chave privada
-  const keyBags = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
-  const keyBag = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag][0];
-  const privateKeyPem = forge.pki.privateKeyToPem(keyBag.key);
-
-  // Extrair certificado(s)
-  const certBags = p12.getBags({ bagType: forge.pki.oids.certBag });
-  const certs = certBags[forge.pki.oids.certBag];
-  const certPems = certs.map(c => forge.pki.certificateToPem(c.cert));
-
-    const agent = new https.Agent({
-    key: privateKeyPem,
-    cert: certPems.join('\n'),
-    rejectUnauthorized: false,
-  });
-    
-
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: 443,
-      path: parsedUrl.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/soap+xml; charset=utf-8",
-        "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
-      },
-      agent: agent,
-    };
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
-      let data = [];
+      const data = [];
       res.on("data", (chunk) => data.push(chunk));
       res.on("end", () => {
         const body = Buffer.concat(data).toString("utf-8");
@@ -142,44 +153,32 @@ async function callSefaz(soapBody) {
   });
 }
 
-// ══════════════════════════════════════════════════════════
-//  CERTIFICADO A1 — carregamento seguro
-// ══════════════════════════════════════════════════════════
-// O certificado .pfx deve ser armazenado como Secret no Firebase.
-// Alternativa: armazenar como base64 no Firestore collection "config".
-
-async function loadCertificate() {
-  // Opção 1: Firebase Secret Manager (recomendado para produção)
-  // const secret = functions.config().sefaz?.cert_pfx_base64;
-
-  // Opção 2: Firestore (mais fácil de configurar)
-  const doc = await db.collection("config").doc("sefaz_cert").get();
-  if (!doc.exists || !doc.data().pfx_base64) {
-    throw new Error("Certificado A1 não encontrado. Faça upload em Configurações > SEFAZ.");
+async function callSefazWithRetry(soapBody) {
+  let lastError;
+  for (let attempt = 0; attempt <= CONFIG.RETRY_MAX; attempt++) {
+    try {
+      return await callSefaz(soapBody);
+    } catch (e) {
+      lastError = e;
+      const msg = e.message || "";
+      const isRetryable = msg.includes("Timeout") || msg.includes("Connection Error") ||
+        msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT") || msg.includes("socket hang up");
+      if (!isRetryable || attempt >= CONFIG.RETRY_MAX) throw e;
+      const delay = CONFIG.RETRY_DELAY_MS * (attempt + 1);
+      console.warn(`[callSefaz] Tentativa ${attempt + 1} falhou (${msg}). Retentando em ${delay}ms...`);
+      await sleep(delay);
+    }
   }
-  return Buffer.from(doc.data().pfx_base64, "base64");
-}
-
-async function loadCertificatePassword() {
-  // Opção 1: Firebase Secret Manager
-  // return functions.config().sefaz?.cert_password;
-
-  // Opção 2: Firestore
-  const doc = await db.collection("config").doc("sefaz_cert").get();
-  if (!doc.exists || !doc.data().password) {
-    throw new Error("Senha do certificado não encontrada.");
-  }
-  return doc.data().password;
+  throw lastError;
 }
 
 // ══════════════════════════════════════════════════════════
-//  PARSER — processa resposta SOAP da SEFAZ
+//  PARSER — resposta SOAP da SEFAZ
 // ══════════════════════════════════════════════════════════
 function parseSefazResponse(xmlResponse) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlResponse, "text/xml");
 
-  // Extrair retDistDFeInt
   const retNode = doc.getElementsByTagNameNS("http://www.portalfiscal.inf.br/nfe", "retDistDFeInt");
   if (!retNode || retNode.length === 0) {
     throw new Error("Resposta SEFAZ inválida: retDistDFeInt não encontrado");
@@ -191,21 +190,10 @@ function parseSefazResponse(xmlResponse) {
   const ultNSU = getTagText(ret, "ultNSU");
   const maxNSU = getTagText(ret, "maxNSU");
 
-  // cStat 137 = Nenhum documento localizado
-  // cStat 138 = Documentos localizados
-  const result = {
-    cStat,
-    xMotivo,
-    ultNSU: ultNSU || "0",
-    maxNSU: maxNSU || "0",
-    documentos: [],
-  };
+  const result = { cStat, xMotivo, ultNSU: ultNSU || "0", maxNSU: maxNSU || "0", documentos: [] };
 
-  if (cStat !== "138") {
-    return result;
-  }
+  if (cStat !== "138") return result;
 
-  // Extrair docZip (documentos comprimidos em gzip + base64)
   const docZips = ret.getElementsByTagNameNS("http://www.portalfiscal.inf.br/nfe", "docZip");
   for (let i = 0; i < docZips.length; i++) {
     const docZip = docZips[i];
@@ -214,17 +202,14 @@ function parseSefazResponse(xmlResponse) {
     const base64Content = docZip.textContent || "";
 
     try {
-      // Descomprimir gzip
       const compressed = Buffer.from(base64Content, "base64");
-      // Tentar gunzip (padrão SEFAZ DFe), depois inflate, depois inflateRaw
-                let xmlContent;
-                try { xmlContent = zlib.gunzipSync(compressed).toString("utf-8"); }
-                catch (_e1) {
-                              try { xmlContent = zlib.inflateSync(compressed).toString("utf-8"); }
-                              catch (_e2) { xmlContent = zlib.inflateRawSync(compressed).toString("utf-8"); }
-                }
+      let xmlContent;
+      try { xmlContent = zlib.gunzipSync(compressed).toString("utf-8"); }
+      catch (_e1) {
+        try { xmlContent = zlib.inflateSync(compressed).toString("utf-8"); }
+        catch (_e2) { xmlContent = zlib.inflateRawSync(compressed).toString("utf-8"); }
+      }
 
-      // Parsear o XML do documento
       const nfeData = parseNFeXMLContent(xmlContent, schema);
       if (nfeData) {
         nfeData._nsu = nsu;
@@ -244,16 +229,13 @@ function parseNFeXMLContent(xmlContent, schema) {
   const doc = parser.parseFromString(xmlContent, "text/xml");
   const ns = "http://www.portalfiscal.inf.br/nfe";
 
-  // Pode ser: nfeProc (NF-e completa), resNFe (resumo), resEvento (evento)
   const isResumo = schema.includes("resNFe") || doc.getElementsByTagNameNS(ns, "resNFe").length > 0;
   const isEvento = schema.includes("resEvento") || doc.getElementsByTagNameNS(ns, "resEvento").length > 0;
   const isNFeCompleta = doc.getElementsByTagNameNS(ns, "nfeProc").length > 0 || doc.getElementsByTagNameNS(ns, "NFe").length > 0;
 
   if (isResumo) {
-    // Resumo da NF-e — dados básicos
     const resNFe = doc.getElementsByTagNameNS(ns, "resNFe")[0];
     if (!resNFe) return null;
-
     return {
       tipo: "resumo",
       chave: resNFe.getAttribute("chNFe") || getTagTextNS(resNFe, ns, "chNFe"),
@@ -262,24 +244,13 @@ function parseNFeXMLContent(xmlContent, schema) {
       ie: getTagTextNS(resNFe, ns, "IE"),
       emissao: (getTagTextNS(resNFe, ns, "dhEmi") || "").substring(0, 10),
       valor: parseFloat(getTagTextNS(resNFe, ns, "vNF")) || 0,
-      situacao: getTagTextNS(resNFe, ns, "cSitNFe"), // 1=autorizada, 2=uso denegado, 3=cancelada
+      situacao: getTagTextNS(resNFe, ns, "cSitNFe"),
       xmlOriginal: xmlContent,
     };
   }
 
-  if (isEvento) {
-    // Evento (cancelamento, carta correção, etc.)
-    return {
-      tipo: "evento",
-      xmlOriginal: xmlContent,
-    };
-  }
-
-  if (isNFeCompleta) {
-    // NF-e completa — extrair tudo
-    return parseNFeCompleta(doc, ns, xmlContent);
-  }
-
+  if (isEvento) return { tipo: "evento", xmlOriginal: xmlContent };
+  if (isNFeCompleta) return parseNFeCompleta(doc, ns, xmlContent);
   return null;
 }
 
@@ -291,7 +262,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
   const chaveId = inf.getAttribute("Id") || "";
   const chave = chaveId.replace(/^NFe/, "");
 
-  // ide
   const ide = inf.getElementsByTagNameNS(ns, "ide");
   let numero = "", serie = "", emissao = "", natOp = "";
   if (ide.length > 0) {
@@ -302,27 +272,53 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     natOp = getTagTextNS(ide[0], ns, "natOp");
   }
 
-  // emit
+  // emit - emitente
   const emit = inf.getElementsByTagNameNS(ns, "emit");
-  let fornNome = "", fornCNPJ = "";
+  let emitNome = "", emitCNPJ = "";
   if (emit.length > 0) {
-    fornNome = getTagTextNS(emit[0], ns, "xFant") || getTagTextNS(emit[0], ns, "xNome");
-    fornCNPJ = getTagTextNS(emit[0], ns, "CNPJ") || getTagTextNS(emit[0], ns, "CPF");
+    emitNome = getTagTextNS(emit[0], ns, "xNome");
+    const emitFant = getTagTextNS(emit[0], ns, "xFant");
+    if (emitFant && emitFant.length > 2) emitNome = emitFant;
+    emitCNPJ = getTagTextNS(emit[0], ns, "CNPJ") || getTagTextNS(emit[0], ns, "CPF");
   }
 
-  // Formatar CNPJ
+  // dest - destinatário
+  const dest = inf.getElementsByTagNameNS(ns, "dest");
+  let destNome = "", destCNPJ = "";
+  if (dest.length > 0) {
+    destNome = getTagTextNS(dest[0], ns, "xNome");
+    const destFant = getTagTextNS(dest[0], ns, "xFant");
+    if (destFant && destFant.length > 2) destNome = destFant;
+    destCNPJ = getTagTextNS(dest[0], ns, "CNPJ") || getTagTextNS(dest[0], ns, "CPF");
+  }
+
+  // Identificar contraparte: se MBDJ é emitente, contraparte é destinatário
+  const emitCNPJLimpo = (emitCNPJ || "").replace(/[.\-\/]/g, "");
+  let fornNome, fornCNPJ;
+  if (emitCNPJLimpo === CONFIG.CNPJ) {
+    fornNome = destNome; fornCNPJ = destCNPJ;
+  } else {
+    fornNome = emitNome; fornCNPJ = emitCNPJ;
+  }
+
   if (fornCNPJ && fornCNPJ.length === 14) {
     fornCNPJ = fornCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
   }
 
-  // total
   const icmsTot = inf.getElementsByTagNameNS(ns, "ICMSTot");
-  let valorTotal = "0";
+  let valorTotal = "0", vICMS = "0", vPIS = "0", vCOFINS = "0", vIPI = "0", vST = "0", vBC = "0", vProd = "0", vBCST = "0";
   if (icmsTot.length > 0) {
     valorTotal = getTagTextNS(icmsTot[0], ns, "vNF");
+    vICMS = getTagTextNS(icmsTot[0], ns, "vICMS");
+    vPIS = getTagTextNS(icmsTot[0], ns, "vPIS");
+    vCOFINS = getTagTextNS(icmsTot[0], ns, "vCOFINS");
+    vIPI = getTagTextNS(icmsTot[0], ns, "vIPI");
+    vST = getTagTextNS(icmsTot[0], ns, "vST");
+    vBC = getTagTextNS(icmsTot[0], ns, "vBC");
+    vProd = getTagTextNS(icmsTot[0], ns, "vProd");
+    vBCST = getTagTextNS(icmsTot[0], ns, "vBCST");
   }
 
-  // produtos
   const dets = inf.getElementsByTagNameNS(ns, "det");
   const produtos = [];
   for (let d = 0; d < dets.length; d++) {
@@ -341,7 +337,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     }
   }
 
-  // duplicatas
   const dups = inf.getElementsByTagNameNS(ns, "dup");
   const duplicatas = [];
   for (let dd = 0; dd < dups.length; dd++) {
@@ -352,15 +347,21 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     });
   }
 
+  const transp = inf.getElementsByTagNameNS(ns, "transp");
+  let modFrete = "";
+  if (transp.length > 0) modFrete = getTagTextNS(transp[0], ns, "modFrete");
+
   return {
     tipo: "nfe_completa",
     numero, serie, emissao, fornecedor: fornNome, cnpj: fornCNPJ,
+    emitente: emitNome, emitenteCNPJ: emitCNPJ,
+    destinatario: destNome, destinatarioCNPJ: destCNPJ,
     valor: valorTotal, chave, natOp, produtos, duplicatas,
-    xmlOriginal,
+    impostos: { vICMS, vPIS, vCOFINS, vIPI, vST, vBC, vProd, vBCST },
+    modFrete, xmlOriginal,
   };
 }
 
-// Helpers XML
 function getTagText(parent, tagName) {
   const els = parent.getElementsByTagName(tagName);
   return els.length > 0 ? (els[0].textContent || "").trim() : "";
@@ -373,139 +374,114 @@ function getTagTextNS(parent, ns, tagName) {
 
 // ══════════════════════════════════════════════════════════
 //  CLOUD FUNCTION: sincronizarSefaz
-//  Chamada pelo frontend via HTTP
 // ══════════════════════════════════════════════════════════
 exports.sincronizarSefaz = functions
   .runWith({ timeoutSeconds: 120, memory: "512MB" })
   .https.onCall(async (data, context) => {
-    // Verificar autenticação
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Usuário não autenticado.");
     }
 
+    const startTime = Date.now();
     console.log(`[sincronizarSefaz] Iniciado por ${context.auth.uid}`);
 
     try {
-      // Carregar último NSU processado
       const configDoc = await db.collection("config").doc("sefaz_sync").get();
       let ultNSU = configDoc.exists ? (configDoc.data().ultNSU || "0") : "0";
 
-      console.log(`[sincronizarSefaz] Último NSU: ${ultNSU}`);
+      let totalDocs = 0, totalNFe = 0, totalResumos = 0, totalEventos = 0;
+      let iterations = 0, hasMore = true;
+      const nfesImportadas = [];
 
-      let totalDocs = 0;
-      let totalNFe = 0;
-      let totalResumos = 0;
-      let iterations = 0;
-      const maxIterations = 10; // Segurança: máximo 10 chamadas por execução
-      let hasMore = true;
-
-      while (hasMore && iterations < maxIterations) {
+      while (hasMore && iterations < CONFIG.MAX_ITERATIONS) {
         iterations++;
-        console.log(`[sincronizarSefaz] Iteração ${iterations}, NSU: ${ultNSU}`);
+        const iterStart = Date.now();
 
-        // Montar e enviar SOAP
         const soapBody = buildSoapDistNSU(ultNSU, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
-        const response = await callSefaz(soapBody);
-
-        // Parsear resposta
+        const response = await callSefazWithRetry(soapBody);
         const result = parseSefazResponse(response);
-        console.log(`[sincronizarSefaz] cStat=${result.cStat} | ${result.xMotivo} | ${result.documentos.length} docs | ultNSU=${result.ultNSU} maxNSU=${result.maxNSU}`);
 
-        if (result.cStat === "137") {
-          // Nenhum documento novo
-          hasMore = false;
-          break;
+        console.log(`[sincronizarSefaz] Iter ${iterations} (${Date.now() - iterStart}ms): cStat=${result.cStat} | ${result.documentos.length} docs | ultNSU=${result.ultNSU}`);
+
+        if (result.cStat === "137") { hasMore = false; break; }
+        if (result.cStat === "656") {
+          console.warn("[sincronizarSefaz] Rate limit SEFAZ (656). Parando.");
+          hasMore = false; break;
         }
-
         if (result.cStat !== "138") {
           throw new Error(`SEFAZ retornou ${result.cStat}: ${result.xMotivo}`);
         }
 
-        // Processar documentos
         for (const doc of result.documentos) {
           totalDocs++;
-
           if (doc.tipo === "nfe_completa") {
-            // Salvar NF-e completa no Firestore
-            await salvarNFeNoFirestore(doc);
+            const saved = await salvarNFeNoFirestore(doc);
             totalNFe++;
+            if (saved) nfesImportadas.push({ numero: doc.numero, fornecedor: doc.fornecedor, valor: doc.valor, emissao: doc.emissao });
           } else if (doc.tipo === "resumo") {
-            // Resumo: se situação = autorizada, buscar NF-e completa por chave
+            totalResumos++;
             if (doc.situacao === "1" && doc.chave) {
               try {
                 const soapChave = buildSoapConsChNFe(doc.chave, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
-                const resChave = await callSefaz(soapChave);
+                const resChave = await callSefazWithRetry(soapChave);
                 const resultChave = parseSefazResponse(resChave);
                 for (const d of resultChave.documentos) {
                   if (d.tipo === "nfe_completa") {
-                    await salvarNFeNoFirestore(d);
+                    const saved = await salvarNFeNoFirestore(d);
                     totalNFe++;
+                    if (saved) nfesImportadas.push({ numero: d.numero, fornecedor: d.fornecedor, valor: d.valor, emissao: d.emissao });
                   }
                 }
+                await sleep(CONFIG.RATE_LIMIT_MS);
               } catch (e) {
                 console.warn(`Erro ao buscar NF-e chave ${doc.chave}:`, e.message);
-                // Salvar resumo mesmo assim
                 await salvarResumoNoFirestore(doc);
               }
-              totalResumos++;
             }
+          } else if (doc.tipo === "evento") {
+            totalEventos++;
           }
-          // Eventos são logados mas não processados por enquanto
         }
 
-        // Atualizar NSU
         ultNSU = result.ultNSU;
         hasMore = parseInt(result.ultNSU) < parseInt(result.maxNSU);
-
-        // Rate limit: aguardar 1s entre chamadas (respeitar SEFAZ)
-        if (hasMore) await sleep(1000);
+        if (hasMore) await sleep(CONFIG.RATE_LIMIT_MS);
       }
 
-      // Salvar último NSU processado
       await db.collection("config").doc("sefaz_sync").set({
-        ultNSU: ultNSU,
-        ultimaSincronizacao: new Date().toISOString(),
-        totalDocsSincronizados: totalDocs,
+        ultNSU, ultimaSincronizacao: new Date().toISOString(), totalDocsSincronizados: totalDocs,
       }, { merge: true });
 
+      const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
       const resultado = {
-        success: true,
-        ultNSU,
-        totalDocs,
-        totalNFe,
-        totalResumos,
-        iteracoes: iterations,
-        hasMore,
+        success: true, ultNSU, totalDocs, totalNFe, totalResumos, totalEventos,
+        iteracoes: iterations, hasMore, duracaoSegundos: duracao,
+        nfesImportadas: nfesImportadas.slice(0, 20),
         msg: totalNFe > 0
-          ? `✅ ${totalNFe} NF-e(s) importada(s) da SEFAZ!`
-          : "Nenhuma NF-e nova encontrada.",
+          ? `✅ ${totalNFe} NF-e(s) importada(s) da SEFAZ em ${duracao}s!`
+          : `Nenhuma NF-e nova encontrada. (${totalDocs} docs processados em ${duracao}s)`,
       };
-
-      console.log(`[sincronizarSefaz] Concluído:`, resultado);
+      console.log(`[sincronizarSefaz] Concluído em ${duracao}s`);
       return resultado;
 
     } catch (error) {
-      console.error("[sincronizarSefaz] ERRO:", error);
+      console.error(`[sincronizarSefaz] ERRO:`, error);
       throw new functions.https.HttpsError("internal", error.message);
     }
   });
 
 // ══════════════════════════════════════════════════════════
-//  SALVAR NF-e NO FIRESTORE (compatível com o frontend)
+//  SALVAR NF-e NO FIRESTORE
 // ══════════════════════════════════════════════════════════
 async function salvarNFeNoFirestore(nfe) {
-  // Verificar duplicata por chave de acesso
   const existing = await db.collection("dados").doc("notas_fiscais").get();
   let nfeItems = [];
 
   if (existing.exists) {
     const data = existing.data();
     if (data._chunked) {
-      // Dados chunked — carregar todos os chunks
       const chunks = await db.collection("dados")
-        .where("_parentKey", "==", "notas_fiscais")
-        .orderBy("_chunkIndex")
-        .get();
+        .where("_parentKey", "==", "notas_fiscais").orderBy("_chunkIndex").get();
       chunks.forEach(c => {
         try { nfeItems = nfeItems.concat(JSON.parse(c.data().valor)); } catch (e) { }
       });
@@ -514,91 +490,134 @@ async function salvarNFeNoFirestore(nfe) {
     }
   }
 
-  // Verificar se já existe
-  if (nfe.chave && nfeItems.some(n => n.chave === nfe.chave)) {
-    console.log(`[salvarNFe] NF-e ${nfe.numero} (chave ${nfe.chave.substring(0, 15)}...) já existe, pulando.`);
-    return;
-  }
+  if (nfe.chave && nfeItems.some(n => n.chave === nfe.chave)) return false;
 
-  // Adicionar no formato compatível com o frontend
   nfeItems.push({
-    numero: nfe.numero,
-    serie: nfe.serie,
-    emissao: nfe.emissao,
-    fornecedor: nfe.fornecedor,
-    cnpj: nfe.cnpj,
+    numero: nfe.numero, serie: nfe.serie, emissao: nfe.emissao,
+    fornecedor: nfe.fornecedor, cnpj: nfe.cnpj,
+    emitente: nfe.emitente || "", emitenteCNPJ: nfe.emitenteCNPJ || "",
+    destinatario: nfe.destinatario || "", destinatarioCNPJ: nfe.destinatarioCNPJ || "",
     valor: formatCurrencyBR(parseFloat(nfe.valor) || 0),
-    chave: nfe.chave,
-    status: "Processada",
-    natOp: nfe.natOp,
-    produtos: nfe.produtos || [],
-    duplicatas: nfe.duplicatas || [],
-    origem: "sefaz_auto",
-    _importadoEm: new Date().toISOString(),
+    chave: nfe.chave, status: "Processada", natOp: nfe.natOp,
+    produtos: nfe.produtos || [], duplicatas: nfe.duplicatas || [],
+    impostos: nfe.impostos || {}, modFrete: nfe.modFrete || "",
+    origem: "sefaz_auto", _importadoEm: new Date().toISOString(),
   });
 
-  // Salvar usando a mesma lógica de chunking do frontend
   const jsonVal = JSON.stringify(nfeItems);
-  const CHUNK_THRESHOLD = 800000;
-  const CHUNK_TARGET = 500000;
+  const CHUNK_THRESHOLD = 800000, CHUNK_TARGET = 500000;
 
   if (jsonVal.length < CHUNK_THRESHOLD) {
-    await db.collection("dados").doc("notas_fiscais").set({
-      valor: jsonVal,
-      atualizado_em: new Date().toISOString(),
-    });
+    await db.collection("dados").doc("notas_fiscais").set({ valor: jsonVal, atualizado_em: new Date().toISOString() });
   } else {
-    // Auto-chunking
-    const chunks = [];
-    let currentChunk = [], currentSize = 0;
-
+    const chunks = []; let currentChunk = [], currentSize = 0;
     for (const item of nfeItems) {
       const itemJson = JSON.stringify(item);
-      if (currentSize + itemJson.length > CHUNK_TARGET && currentChunk.length > 0) {
-        chunks.push(currentChunk);
-        currentChunk = [];
-        currentSize = 0;
-      }
-      currentChunk.push(item);
-      currentSize += itemJson.length;
+      if (currentSize + itemJson.length > CHUNK_TARGET && currentChunk.length > 0) { chunks.push(currentChunk); currentChunk = []; currentSize = 0; }
+      currentChunk.push(item); currentSize += itemJson.length;
     }
     if (currentChunk.length > 0) chunks.push(currentChunk);
 
-    // Limpar chunks antigos
-    const oldChunks = await db.collection("dados")
-      .where("_parentKey", "==", "notas_fiscais").get();
-    const batch = db.batch();
-    oldChunks.forEach(d => batch.delete(d.ref));
-    await batch.commit();
+    const oldChunks = await db.collection("dados").where("_parentKey", "==", "notas_fiscais").get();
+    if (!oldChunks.empty) { const batch = db.batch(); oldChunks.forEach(d => batch.delete(d.ref)); await batch.commit(); }
 
-    // Salvar manifesto
-    await db.collection("dados").doc("notas_fiscais").set({
-      _chunked: true,
-      _totalChunks: chunks.length,
-      _totalItems: nfeItems.length,
-      atualizado_em: new Date().toISOString(),
-    });
-
-    // Salvar chunks
+    await db.collection("dados").doc("notas_fiscais").set({ _chunked: true, _totalChunks: chunks.length, _totalItems: nfeItems.length, atualizado_em: new Date().toISOString() });
     for (let i = 0; i < chunks.length; i++) {
-      await db.collection("dados").doc(`notas_fiscais__chunk_${i}`).set({
-        valor: JSON.stringify(chunks[i]),
-        _parentKey: "notas_fiscais",
-        _chunkIndex: i,
-        atualizado_em: new Date().toISOString(),
-      });
+      await db.collection("dados").doc(`notas_fiscais__chunk_${i}`).set({ valor: JSON.stringify(chunks[i]), _parentKey: "notas_fiscais", _chunkIndex: i, atualizado_em: new Date().toISOString() });
+    }
+  }
+  console.log(`[salvarNFe] NF-e ${nfe.numero} salva (total: ${nfeItems.length})`);
+
+  // Gerar créditos tributários automaticamente (se aplicável)
+  await gerarCreditosTribServer(nfe);
+
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════
+//  GERAÇÃO AUTOMÁTICA DE CRÉDITOS TRIBUTÁRIOS (server)
+// ══════════════════════════════════════════════════════════
+const CFOPS_CREDITO = ['5401','5403','5405','6401','6403','6405','1401','1403','2401','2403'];
+
+async function gerarCreditosTribServer(nfe) {
+  // Só gera se MBDJ é destinatário (emitente ≠ MBDJ)
+  const emitCNPJLimpo = (nfe.emitenteCNPJ || nfe.cnpj || "").replace(/[.\-\/]/g, "");
+  if (emitCNPJLimpo === CONFIG.CNPJ) return 0;
+
+  const cfopsNFe = (nfe.produtos || []).map(p => String(p.cfop || ""));
+  const temCfopCredito = cfopsNFe.some(c => CFOPS_CREDITO.includes(c));
+  if (!temCfopCredito) return 0;
+
+  const impostos = nfe.impostos || {};
+  const vPIS = parseFloat(impostos.vPIS) || 0;
+  const vCOFINS = parseFloat(impostos.vCOFINS) || 0;
+  const vICMS = parseFloat(impostos.vICMS) || 0;
+  const vBC = parseFloat(impostos.vBC) || 0;
+  const vProd = parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0;
+  if (vPIS === 0 && vCOFINS === 0 && vICMS === 0) return 0;
+
+  // Calcular alíquotas efetivas
+  const aliqPIS = vProd > 0 ? (vPIS / vProd * 100) : 0;
+  const aliqCOFINS = vProd > 0 ? (vCOFINS / vProd * 100) : 0;
+  const aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
+
+  // Carregar créditos existentes
+  const ctDoc = await db.collection("dados").doc("creditos_trib").get();
+  let ctItems = [];
+  if (ctDoc.exists) {
+    const data = ctDoc.data();
+    if (data._chunked) {
+      const chunks = await db.collection("dados").where("_parentKey", "==", "creditos_trib").orderBy("_chunkIndex").get();
+      chunks.forEach(c => { try { ctItems = ctItems.concat(JSON.parse(c.data().valor)); } catch (e) {} });
+    } else if (data.valor) {
+      try { ctItems = JSON.parse(data.valor); } catch (e) { ctItems = []; }
     }
   }
 
-  console.log(`[salvarNFe] NF-e ${nfe.numero} salva (total: ${nfeItems.length})`);
+  const nfeRef = String(nfe.numero || "");
+  if (ctItems.some(ct => ct.nfRef === nfeRef && ct._chaveNFe === nfe.chave)) return 0;
+
+  const competencia = nfe.emissao || "";
+  const fornecedor = nfe.fornecedor || "";
+  const cfopsStr = cfopsNFe.filter(c => CFOPS_CREDITO.includes(c)).join(", ");
+  let count = 0;
+
+  if (vPIS > 0) {
+    ctItems.push({ imposto: "PIS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vPIS), baseCalculo: formatCurrencyBR(vProd), aliquota: aliqPIS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `PIS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
+    count++;
+  }
+  if (vCOFINS > 0) {
+    ctItems.push({ imposto: "COFINS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vCOFINS), baseCalculo: formatCurrencyBR(vProd), aliquota: aliqCOFINS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `COFINS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
+    count++;
+  }
+  if (vICMS > 0) {
+    ctItems.push({ imposto: "ICMS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vICMS), baseCalculo: formatCurrencyBR(vBC), aliquota: aliqICMS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `ICMS próprio s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
+    count++;
+  }
+
+  if (count > 0) {
+    const jsonVal = JSON.stringify(ctItems);
+    if (jsonVal.length < 800000) {
+      await db.collection("dados").doc("creditos_trib").set({ valor: jsonVal, atualizado_em: new Date().toISOString() });
+    } else {
+      const chunks = []; let curr = [], sz = 0;
+      for (const item of ctItems) { const ij = JSON.stringify(item); if (sz + ij.length > 500000 && curr.length > 0) { chunks.push(curr); curr = []; sz = 0; } curr.push(item); sz += ij.length; }
+      if (curr.length > 0) chunks.push(curr);
+      const old = await db.collection("dados").where("_parentKey", "==", "creditos_trib").get();
+      if (!old.empty) { const b = db.batch(); old.forEach(d => b.delete(d.ref)); await b.commit(); }
+      await db.collection("dados").doc("creditos_trib").set({ _chunked: true, _totalChunks: chunks.length, _totalItems: ctItems.length, atualizado_em: new Date().toISOString() });
+      for (let i = 0; i < chunks.length; i++) { await db.collection("dados").doc(`creditos_trib__chunk_${i}`).set({ valor: JSON.stringify(chunks[i]), _parentKey: "creditos_trib", _chunkIndex: i, atualizado_em: new Date().toISOString() }); }
+    }
+    console.log(`[CreditosTrib] ${count} crédito(s) gerado(s) para NF-e ${nfeRef} de ${fornecedor} | PIS: ${aliqPIS.toFixed(2)}% COFINS: ${aliqCOFINS.toFixed(2)}% ICMS: ${aliqICMS.toFixed(2)}%`);
+  }
+  return count;
 }
 
 async function salvarResumoNoFirestore(resumo) {
-  // Salvar resumos em coleção separada para referência
   if (resumo.chave) {
     await db.collection("sefaz_resumos").doc(resumo.chave).set({
-      ...resumo,
-      xmlOriginal: undefined, // Não salvar XML do resumo
+      tipo: resumo.tipo, chave: resumo.chave, cnpj: resumo.cnpj, nome: resumo.nome,
+      emissao: resumo.emissao, valor: resumo.valor, situacao: resumo.situacao,
       _importadoEm: new Date().toISOString(),
     });
   }
@@ -606,52 +625,38 @@ async function salvarResumoNoFirestore(resumo) {
 
 // ══════════════════════════════════════════════════════════
 //  CLOUD FUNCTION: uploadCertificado
-//  Recebe o .pfx em base64 e armazena no Firestore
 // ══════════════════════════════════════════════════════════
 exports.uploadCertificado = functions
   .runWith({ timeoutSeconds: 30, memory: "256MB" })
   .https.onCall(async (data, context) => {
-    if (!context.auth) {
-      throw new functions.https.HttpsError("unauthenticated", "Não autenticado.");
-    }
+    if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Não autenticado.");
 
     const { pfxBase64, password } = data;
-    if (!pfxBase64 || !password) {
-      throw new functions.https.HttpsError("invalid-argument", "Certificado e senha são obrigatórios.");
-    }
+    if (!pfxBase64 || !password) throw new functions.https.HttpsError("invalid-argument", "Certificado e senha são obrigatórios.");
 
-    // Validar que o PFX é válido
     try {
-      const crypto = require("crypto");
-      // Tentar decodificar para validar
       const pfxBuffer = Buffer.from(pfxBase64, "base64");
-      // Básico: verificar que tem tamanho razoável
-      if (pfxBuffer.length < 100) throw new Error("Arquivo muito pequeno");
+      if (pfxBuffer.length < 100) throw new Error("Arquivo muito pequeno para ser um PFX válido");
       if (pfxBuffer.length > 50000) throw new Error("Arquivo muito grande (max 50KB)");
+      tls.createSecureContext({ pfx: pfxBuffer, passphrase: password });
     } catch (e) {
-      throw new functions.https.HttpsError("invalid-argument", `Certificado inválido: ${e.message}`);
+      const msg = e.message || "";
+      if (msg.includes("mac verify failure") || msg.includes("bad decrypt")) throw new functions.https.HttpsError("invalid-argument", "Senha do certificado incorreta.");
+      if (msg.includes("routines") || msg.includes("asn1")) throw new functions.https.HttpsError("invalid-argument", "Arquivo não é um certificado PFX/P12 válido.");
+      throw new functions.https.HttpsError("invalid-argument", `Certificado inválido: ${msg}`);
     }
 
-    // Salvar no Firestore
-    await db.collection("config").doc("sefaz_cert").set({
-      pfx_base64: pfxBase64,
-      password: password,
-      uploadedAt: new Date().toISOString(),
-      uploadedBy: context.auth.uid,
-    });
-
-    return { success: true, msg: "Certificado A1 salvo com sucesso!" };
+    _certCache = null;
+    await db.collection("config").doc("sefaz_cert").set({ pfx_base64: pfxBase64, password, uploadedAt: new Date().toISOString(), uploadedBy: context.auth.uid });
+    return { success: true, msg: "✅ Certificado A1 validado e salvo com sucesso!" };
   });
 
 // ══════════════════════════════════════════════════════════
 //  CLOUD FUNCTION: statusSefaz
-//  Retorna status da configuração (certificado, último sync, etc.)
 // ══════════════════════════════════════════════════════════
 exports.statusSefaz = functions
   .https.onCall(async (data, context) => {
-    if (!context.auth) {
-      throw new functions.https.HttpsError("unauthenticated", "Não autenticado.");
-    }
+    if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Não autenticado.");
 
     const certDoc = await db.collection("config").doc("sefaz_cert").get();
     const syncDoc = await db.collection("config").doc("sefaz_sync").get();
@@ -661,6 +666,7 @@ exports.statusSefaz = functions
       certificadoUploadedAt: certDoc.exists ? certDoc.data().uploadedAt : null,
       ultimaSincronizacao: syncDoc.exists ? syncDoc.data().ultimaSincronizacao : null,
       ultNSU: syncDoc.exists ? syncDoc.data().ultNSU : "0",
+      totalDocsSincronizados: syncDoc.exists ? syncDoc.data().totalDocsSincronizados : 0,
       cnpj: CONFIG.CNPJ,
       ambiente: CONFIG.AMBIENTE === "1" ? "Produção" : "Homologação",
     };
@@ -670,7 +676,4 @@ exports.statusSefaz = functions
 //  HELPERS
 // ══════════════════════════════════════════════════════════
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function formatCurrencyBR(n) {
-  return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-}
+function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }

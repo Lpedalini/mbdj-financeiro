@@ -154,7 +154,6 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-functions-compat.js"></script>
   <script>
     var firebaseConfig = {
       apiKey: "AIzaSyDS98hD_Z7iplSmXlmz7-A6QjBT1lG1Au0",
@@ -1498,17 +1497,47 @@ function exportarContasBancarias() {
 // ============================================================
 // === NOTA FISCAL ELETRÔNICA ===
 // ============================================================
+function _getNfeCfops(item) {
+  // Extrai CFOPs únicos dos produtos da NF-e
+  if(!item.produtos||item.produtos.length===0) return [];
+  var cfops={};
+  item.produtos.forEach(function(p){ if(p.cfop) cfops[p.cfop]=true; });
+  return Object.keys(cfops).sort();
+}
+function _getCfopTipo(cfop) {
+  if(!cfop) return '';
+  var c=String(cfop);
+  if(c.startsWith('1')||c.startsWith('2')||c.startsWith('3')) return 'Entrada';
+  if(c.startsWith('5')||c.startsWith('6')||c.startsWith('7')) return 'Saída';
+  return '';
+}
+function _getCfopBadge(cfop) {
+  var tipo=_getCfopTipo(cfop);
+  if(tipo==='Entrada') return '<span style="background:#d4edda;color:#155724;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">'+cfop+'</span>';
+  if(tipo==='Saída') return '<span style="background:#cce5ff;color:#004085;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">'+cfop+'</span>';
+  return '<span style="font-size:10px;">'+cfop+'</span>';
+}
 function renderNFe() {
   var content=document.getElementById('main-content');
   var fornecs=getData('fornecedores');
   var fO=fornecs.map(function(f){return '<option value="'+f.nome+'">'+f.nome+'</option>';}).join('');
+  // Extrair CFOPs únicos de todas as NF-e para o filtro
+  var allNfes=getData('notas_fiscais');
+  var allCfops={};
+  allNfes.forEach(function(nfe){ _getNfeCfops(nfe).forEach(function(c){ allCfops[c]=true; }); });
+  var cfopKeys=Object.keys(allCfops).sort();
+  var cfopOpts=cfopKeys.map(function(c){ var t=_getCfopTipo(c); return '<option value="'+c+'">'+c+(t?' ('+t+')':'')+'</option>'; }).join('');
   content.innerHTML='<div class="filter-panel"><h3>🔍 Nota Fiscal Eletrônica</h3>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
     '<div><label>Emissão de:</label><input type="date" id="nfe-de"></div>'+
     '<div><label>Emissão até:</label><input type="date" id="nfe-ate"></div>'+
     '<div><label>Status:</label><select id="nfe-status"><option value="Todos">Todos</option><option value="Processada">Processada</option><option value="Pendente">Pendente</option></select></div>'+
     '<div><label>Fornecedor:</label><input type="text" id="nfe-forn" placeholder="Digite aqui..."></div></div>'+
-    '<div style="display:flex;gap:8px;"><button class="btn-secondary" onclick="limparNFe()">Limpar</button><button class="btn-primary" onclick="pesquisarNFe()">Pesquisar</button></div></div>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
+    '<div><label>CFOP:</label><select id="nfe-cfop"><option value="">Todos</option><option value="entrada">📥 Todos de Entrada (1xxx/2xxx/3xxx)</option><option value="saida">📤 Todos de Saída (5xxx/6xxx/7xxx)</option>'+cfopOpts+'</select></div>'+
+    '<div><label>Nat. Operação:</label><input type="text" id="nfe-natop" placeholder="Ex: Compra, Venda, Devolução..."></div>'+
+    '<div><label>Origem:</label><select id="nfe-origem"><option value="">Todas</option><option value="sefaz_auto">🔄 SEFAZ (automático)</option><option value="xml_manual">📄 XML (manual)</option><option value="manual">✏️ Manual</option></select></div>'+
+    '<div style="display:flex;align-items:flex-end;"><div style="display:flex;gap:8px;width:100%;"><button class="btn-secondary" onclick="limparNFe()" style="flex:1;">Limpar</button><button class="btn-primary" onclick="pesquisarNFe()" style="flex:1;">Pesquisar</button></div></div></div></div>'+
     '<div id="nfe-results"></div>';
   pesquisarNFe();
 }
@@ -1517,10 +1546,32 @@ function pesquisarNFe() {
   var items=allItems.slice();
   var de=document.getElementById('nfe-de').value;var ate=document.getElementById('nfe-ate').value;
   var st=document.getElementById('nfe-status').value;var forn=document.getElementById('nfe-forn').value.trim().toLowerCase();
+  var cfopFiltro=document.getElementById('nfe-cfop')?document.getElementById('nfe-cfop').value:'';
+  var natopFiltro=document.getElementById('nfe-natop')?document.getElementById('nfe-natop').value.trim().toLowerCase():'';
+  var origemFiltro=document.getElementById('nfe-origem')?document.getElementById('nfe-origem').value:'';
   if(de) items=items.filter(function(i){return i.emissao>=de;});
   if(ate) items=items.filter(function(i){return i.emissao<=ate;});
   if(st!=='Todos') items=items.filter(function(i){return i.status===st;});
   if(forn) items=items.filter(function(i){return (i.fornecedor||'').toLowerCase().includes(forn);});
+  if(natopFiltro) items=items.filter(function(i){return (i.natOp||'').toLowerCase().includes(natopFiltro);});
+  if(origemFiltro) {
+    items=items.filter(function(i){
+      var orig=i.origem||'';
+      if(origemFiltro==='sefaz_auto') return orig==='sefaz_auto';
+      if(origemFiltro==='xml_manual') return orig===''||orig==='xml_manual'; // XMLs importados manualmente não tinham campo origem
+      if(origemFiltro==='manual') return orig==='manual';
+      return true;
+    });
+  }
+  // Filtro CFOP — verifica se algum produto da NF-e tem o CFOP
+  if(cfopFiltro) {
+    items=items.filter(function(i){
+      var cfops=_getNfeCfops(i);
+      if(cfopFiltro==='entrada') return cfops.some(function(c){return c.startsWith('1')||c.startsWith('2')||c.startsWith('3');});
+      if(cfopFiltro==='saida') return cfops.some(function(c){return c.startsWith('5')||c.startsWith('6')||c.startsWith('7');});
+      return cfops.indexOf(cfopFiltro)>=0;
+    });
+  }
 
   window._nfeFilteredItems = items;
   window._nfeFilteredIdxMap = items.map(function(item){ return allItems.indexOf(item); });
@@ -1529,15 +1580,21 @@ function pesquisarNFe() {
   var rows=items.map(function(item,fIdx){
     var realIdx = window._nfeFilteredIdxMap[fIdx];
     var val=parseCurrency(item.valor);total+=val;
-    return '<tr><td><span class="expand-btn" onclick="toggleNFeRow(this,'+fIdx+')">▶</span></td><td>'+(item.numero||'')+'</td><td>'+(item.serie||'')+'</td><td>'+formatDateBR(item.emissao)+'</td><td>'+(item.fornecedor||'')+'</td><td>'+(item.cnpj||'')+'</td><td style="text-align:right">'+formatCurrency(val)+'</td><td>'+(item.status||'Processada')+'</td><td title="'+(item.chave||'')+'" style="max-width:120px;overflow:hidden;text-overflow:ellipsis;">'+((item.chave||'').length>20?(item.chave||'').substring(0,20)+'…':(item.chave||''))+'</td><td style="white-space:nowrap;"><button style="background:#dc3545;color:white;border:none;padding:2px 6px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="deletarNFe('+realIdx+')" title="Excluir">🗑️</button></td></tr>'+
-    '<tr id="nfe-detail-'+fIdx+'" style="display:none;"><td colspan="10" style="background:#f8f9fa;padding:10px;">'+
-    '<div style="display:flex;gap:10px;margin-bottom:10px;"><button class="btn-primary" onclick="gerarTituloCPFromNFe('+fIdx+')">📋 Gerar Título (CP)</button>'+(item.natOp?'<span style="font-size:11px;color:#666;padding-top:6px;">Nat. Op: '+item.natOp+'</span>':'')+'</div>'+
+    var cfops=_getNfeCfops(item);
+    var cfopCell=cfops.length>0?cfops.map(function(c){return _getCfopBadge(c);}).join(' '):'<span style="color:#aaa;font-size:10px;">—</span>';
+    var natOpShort=(item.natOp||'').length>25?(item.natOp||'').substring(0,25)+'…':(item.natOp||'');
+    var origemBadge='';
+    if(item.origem==='sefaz_auto') origemBadge='<span style="background:#e8f4fd;color:#1a5276;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;">SEFAZ</span>';
+    else origemBadge='<span style="background:#f0f0f0;color:#666;padding:1px 5px;border-radius:3px;font-size:9px;">XML</span>';
+    return '<tr><td><span class="expand-btn" onclick="toggleNFeRow(this,'+fIdx+')">▶</span></td><td>'+(item.numero||'')+'</td><td>'+(item.serie||'')+'</td><td>'+formatDateBR(item.emissao)+'</td><td>'+(item.fornecedor||'')+'</td><td>'+cfopCell+'</td><td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(item.natOp||'')+'">'+natOpShort+'</td><td style="text-align:right">'+formatCurrency(val)+'</td><td>'+origemBadge+'</td><td>'+(item.status||'Processada')+'</td><td style="white-space:nowrap;"><button style="background:#dc3545;color:white;border:none;padding:2px 6px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="deletarNFe('+realIdx+')" title="Excluir">🗑️</button></td></tr>'+
+    '<tr id="nfe-detail-'+fIdx+'" style="display:none;"><td colspan="11" style="background:#f8f9fa;padding:10px;">'+
+    '<div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;"><button class="btn-primary" onclick="gerarTituloCPFromNFe('+fIdx+')">📋 Gerar Título (CP)</button>'+(item.natOp?'<span style="font-size:11px;color:#666;padding-top:6px;">Nat. Op: '+item.natOp+'</span>':'')+(item.cnpj?'<span style="font-size:11px;color:#888;padding-top:6px;">CNPJ: '+item.cnpj+'</span>':'')+(item.chave?'<span style="font-size:10px;color:#aaa;padding-top:6px;" title="'+item.chave+'">Chave: '+item.chave.substring(0,25)+'…</span>':'')+'</div>'+
     ((item.duplicatas&&item.duplicatas.length>0)?'<div style="margin-bottom:10px;"><strong style="color:#856404;">📅 Duplicatas/Vencimentos:</strong><table style="width:100%;margin-top:5px;font-size:12px;"><thead><tr style="background:#ffeeba;"><th>Parcela</th><th>Vencimento</th><th style="text-align:right">Valor</th></tr></thead><tbody>'+item.duplicatas.map(function(d){return '<tr><td>'+(d.nDup||'')+'</td><td>'+formatDateBR(d.dVenc)+'</td><td style="text-align:right">'+formatCurrency(parseFloat(d.vDup)||0)+'</td></tr>';}).join('')+'</tbody></table></div>':'')+
-    '<strong>Produtos:</strong><table style="width:100%;margin-top:5px;font-size:12px;"><thead><tr style="background:#e9ecef;"><th>Código</th><th>Descrição</th><th>CFOP</th><th>Qtd</th><th>V. Unit</th><th>V. Total</th></tr></thead><tbody>'+
-    (item.produtos||[]).map(function(p){return '<tr><td>'+(p.codigo||'')+'</td><td>'+(p.descricao||'')+'</td><td>'+(p.cfop||'')+'</td><td>'+(p.qtd||'')+'</td><td style="text-align:right">'+formatCurrency(parseCurrency(p.vUnit||'0'))+'</td><td style="text-align:right">'+formatCurrency(parseCurrency(p.vTotal||'0'))+'</td></tr>';}).join('')+
+    '<strong>Produtos:</strong><table style="width:100%;margin-top:5px;font-size:12px;"><thead><tr style="background:#e9ecef;"><th>Código</th><th>Descrição</th><th>CFOP</th><th>NCM</th><th>Qtd</th><th>V. Unit</th><th>V. Total</th></tr></thead><tbody>'+
+    (item.produtos||[]).map(function(p){return '<tr><td>'+(p.codigo||'')+'</td><td>'+(p.descricao||'')+'</td><td>'+_getCfopBadge(p.cfop)+'</td><td style="font-size:10px;color:#888;">'+(p.ncm||'')+'</td><td>'+(p.qtd||'')+'</td><td style="text-align:right">'+formatCurrency(parseCurrency(p.vUnit||'0'))+'</td><td style="text-align:right">'+formatCurrency(parseCurrency(p.vTotal||'0'))+'</td></tr>';}).join('')+
     '</tbody></table></td></tr>';
   }).join('');
-  document.getElementById('nfe-results').innerHTML='<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th style="width:30px"></th><th>Número</th><th>Série</th><th>Emissão</th><th>Fornecedor</th><th>CNPJ</th><th>Valor</th><th>Status</th><th>Chave</th><th>Ações</th></tr></thead><tbody>'+rows+'<tr style="font-weight:bold;background:#f0f0f0;"><td colspan="6" style="text-align:right">Total:</td><td style="text-align:right">'+formatCurrency(total)+'</td><td colspan="3"></td></tr></tbody></table></div>'+
+  document.getElementById('nfe-results').innerHTML='<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th style="width:30px"></th><th>Número</th><th>Série</th><th>Emissão</th><th>Fornecedor</th><th>CFOP</th><th>Nat. Operação</th><th style="text-align:right">Valor</th><th>Origem</th><th>Status</th><th>Ações</th></tr></thead><tbody>'+rows+'<tr style="font-weight:bold;background:#f0f0f0;"><td colspan="7" style="text-align:right">Total:</td><td style="text-align:right">'+formatCurrency(total)+'</td><td colspan="3"></td></tr></tbody></table></div>'+
   '<div class="action-bar"><div class="left"><button class="btn-primary" onclick="criarNFe()">+ NOVA NF-e</button><button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="showImportXML()">📥 IMPORTAR XML</button>'+
     '<span style="color:#ccc;font-size:11px;">|</span>'+
     '<button id="btn-sync-sefaz" style="background:#1a5276;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="sincronizarSefaz()">🔄 SINCRONIZAR SEFAZ</button>'+
@@ -1545,7 +1602,7 @@ function pesquisarNFe() {
   '</div><div class="right">'+items.length+' itens</div></div>';
 }
 function toggleNFeRow(btn,idx){var d=document.getElementById('nfe-detail-'+idx);if(d.style.display==='none'){d.style.display='';btn.textContent='▼';}else{d.style.display='none';btn.textContent='▶';}}
-function limparNFe(){document.getElementById('nfe-de').value='';document.getElementById('nfe-ate').value='';document.getElementById('nfe-status').value='Todos';document.getElementById('nfe-forn').value='';pesquisarNFe();}
+function limparNFe(){document.getElementById('nfe-de').value='';document.getElementById('nfe-ate').value='';document.getElementById('nfe-status').value='Todos';document.getElementById('nfe-forn').value='';if(document.getElementById('nfe-cfop'))document.getElementById('nfe-cfop').value='';if(document.getElementById('nfe-natop'))document.getElementById('nfe-natop').value='';if(document.getElementById('nfe-origem'))document.getElementById('nfe-origem').value='';pesquisarNFe();}
 function deletarNFe(idx) {
   if(!confirm('Excluir esta NF-e?')) return;
   var items = getData('notas_fiscais');
@@ -1616,7 +1673,7 @@ function criarNFe() {
 }
 function salvarNFe() {
   var items=getData('notas_fiscais');
-  items.push({numero:document.getElementById('nfe-f-numero').value,serie:document.getElementById('nfe-f-serie').value,emissao:document.getElementById('nfe-f-emissao').value,fornecedor:document.getElementById('nfe-f-forn').value,cnpj:document.getElementById('nfe-f-cnpj').value,valor:document.getElementById('nfe-f-valor').value,chave:document.getElementById('nfe-f-chave').value,status:'Processada',produtos:[]});
+  items.push({numero:document.getElementById('nfe-f-numero').value,serie:document.getElementById('nfe-f-serie').value,emissao:document.getElementById('nfe-f-emissao').value,fornecedor:document.getElementById('nfe-f-forn').value,cnpj:document.getElementById('nfe-f-cnpj').value,valor:document.getElementById('nfe-f-valor').value,chave:document.getElementById('nfe-f-chave').value,status:'Processada',produtos:[],origem:'manual'});
   setData('notas_fiscais',items);closeModal();pesquisarNFe();
   showToast('NF-e salva!');
 }
@@ -1716,14 +1773,38 @@ function parseNFeXML(xmlText, fileName) {
     natOp = getTagText(ide[0], 'natOp');
   }
 
-  // emit - emitente (fornecedor)
+  // emit - emitente
   var emit = getTag(infNFe, 'emit');
-  var fornNome='', fornCNPJ='';
+  var emitNome='', emitCNPJ='';
   if(emit.length>0) {
-    fornNome = getTagText(emit[0], 'xFant');
-    if(!fornNome) fornNome = getTagText(emit[0], 'xNome');
-    fornCNPJ = getTagText(emit[0], 'CNPJ');
-    if(!fornCNPJ) fornCNPJ = getTagText(emit[0], 'CPF');
+    emitNome = getTagText(emit[0], 'xNome');
+    var emitFant = getTagText(emit[0], 'xFant');
+    if(emitFant && emitFant.length > 2) emitNome = emitFant; // Só usa fantasia se estiver preenchido
+    emitCNPJ = getTagText(emit[0], 'CNPJ');
+    if(!emitCNPJ) emitCNPJ = getTagText(emit[0], 'CPF');
+  }
+
+  // dest - destinatário
+  var dest = getTag(infNFe, 'dest');
+  var destNome='', destCNPJ='';
+  if(dest.length>0) {
+    destNome = getTagText(dest[0], 'xNome');
+    var destFant = getTagText(dest[0], 'xFant');
+    if(destFant && destFant.length > 2) destNome = destFant;
+    destCNPJ = getTagText(dest[0], 'CNPJ');
+    if(!destCNPJ) destCNPJ = getTagText(dest[0], 'CPF');
+  }
+
+  // Identificar contraparte: se MBDJ é emitente, a contraparte é o destinatário e vice-versa
+  var cnpjMBDJ = '44578505000103';
+  var emitCNPJLimpo = (emitCNPJ||'').replace(/[.\-\/]/g,'');
+  var fornNome, fornCNPJ, tipoOperacao;
+  if(emitCNPJLimpo === cnpjMBDJ) {
+    // MBDJ emitiu a nota → contraparte é o destinatário (cliente)
+    fornNome = destNome; fornCNPJ = destCNPJ; tipoOperacao = 'saida';
+  } else {
+    // Outro emitiu → contraparte é o emitente (fornecedor)
+    fornNome = emitNome; fornCNPJ = emitCNPJ; tipoOperacao = 'entrada';
   }
 
   // Formatar CNPJ
@@ -1731,11 +1812,22 @@ function parseNFeXML(xmlText, fileName) {
     fornCNPJ = fornCNPJ.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
   }
 
-  // total
+  // total + impostos detalhados
   var icmsTot = getTag(infNFe, 'ICMSTot');
   var valorTotal = '0';
+  var vICMS='0', vPIS='0', vCOFINS='0', vIPI='0', vST='0', vFrete='0', vDesc='0', vBC='0', vProd='0', vBCST='0';
   if(icmsTot.length>0) {
     valorTotal = getTagText(icmsTot[0], 'vNF');
+    vICMS = getTagText(icmsTot[0], 'vICMS');
+    vPIS = getTagText(icmsTot[0], 'vPIS');
+    vCOFINS = getTagText(icmsTot[0], 'vCOFINS');
+    vIPI = getTagText(icmsTot[0], 'vIPI');
+    vST = getTagText(icmsTot[0], 'vST');
+    vFrete = getTagText(icmsTot[0], 'vFrete');
+    vDesc = getTagText(icmsTot[0], 'vDesc');
+    vBC = getTagText(icmsTot[0], 'vBC');
+    vProd = getTagText(icmsTot[0], 'vProd');
+    vBCST = getTagText(icmsTot[0], 'vBCST');
   }
 
   // produtos (det)
@@ -1778,9 +1870,15 @@ function parseNFeXML(xmlText, fileName) {
     emissao: emissao,
     fornecedor: fornNome,
     cnpj: fornCNPJ,
+    emitente: emitNome,
+    emitenteCNPJ: emitCNPJ,
+    destinatario: destNome,
+    destinatarioCNPJ: destCNPJ,
+    tipoOperacao: tipoOperacao,
     valor: valorTotal,
     chave: chave,
     natOp: natOp,
+    impostos: {vICMS:vICMS, vPIS:vPIS, vCOFINS:vCOFINS, vIPI:vIPI, vST:vST, vFrete:vFrete, vDesc:vDesc, vBC:vBC, vProd:vProd, vBCST:vBCST},
     produtos: produtos,
     duplicatas: duplicatas,
     infCpl: infCpl,
@@ -1864,6 +1962,7 @@ async function confirmImportXML() {
   var cpCount = 0;
   var newFornecs = 0;
   var skippedDup = 0;
+  var ctCount = 0;
 
   nfes.forEach(function(nfe) {
     // Verificar duplicata pela chave de acesso
@@ -1879,13 +1978,24 @@ async function confirmImportXML() {
       emissao: nfe.emissao,
       fornecedor: nfe.fornecedor,
       cnpj: nfe.cnpj,
+      emitente: nfe.emitente || '',
+      emitenteCNPJ: nfe.emitenteCNPJ || '',
+      destinatario: nfe.destinatario || '',
+      destinatarioCNPJ: nfe.destinatarioCNPJ || '',
+      tipoOperacao: nfe.tipoOperacao || '',
       valor: formatCurrency(parseFloat(nfe.valor)||0),
       chave: nfe.chave,
       status: 'Processada',
       natOp: nfe.natOp,
+      impostos: nfe.impostos || {},
       produtos: nfe.produtos,
-      duplicatas: nfe.duplicatas
+      duplicatas: nfe.duplicatas,
+      origem: 'xml_manual'
     });
+
+    // Gerar créditos tributários automaticamente (se aplicável)
+    var creditosGerados = gerarCreditosTribFromNFe(nfe);
+    if(creditosGerados > 0) ctCount += creditosGerados;
 
     // Auto-cadastrar fornecedor se não existir
     var fornExiste = fornecs.find(function(f){ return f.nome === nfe.fornecedor || f.cnpj === nfe.cnpj; });
@@ -1960,8 +2070,100 @@ async function confirmImportXML() {
   var msg = '✅ '+(nfes.length-skippedDup)+' NF-e(s) importada(s)!';
   if(skippedDup>0) msg += ' | '+skippedDup+' duplicada(s) ignorada(s).';
   if(gerarCP) msg += ' | '+cpCount+' título(s) gerado(s) no Contas a Pagar.';
+  if(ctCount>0) msg += ' | 🧾 '+ctCount+' crédito(s) tributário(s) gerado(s) automaticamente.';
   if(newFornecs>0) msg += ' | '+newFornecs+' fornecedor(es) auto-cadastrado(s).';
   showToast(msg);
+}
+
+// ============================================================
+// === GERAÇÃO AUTOMÁTICA DE CRÉDITOS TRIBUTÁRIOS =============
+// ============================================================
+// CFOPs que geram direito a crédito quando MBDJ é destinatário (compra)
+var _CFOPS_CREDITO = ['5401','5403','5405','6401','6403','6405','1401','1403','2401','2403'];
+
+function gerarCreditosTribFromNFe(nfe) {
+  // Só gera crédito se MBDJ é destinatário (compra/entrada)
+  if(nfe.tipoOperacao !== 'entrada') return 0;
+
+  // Verificar se algum produto tem CFOP que gera crédito
+  var cfopsNFe = (nfe.produtos||[]).map(function(p){ return String(p.cfop||''); });
+  var temCfopCredito = cfopsNFe.some(function(c){ return _CFOPS_CREDITO.indexOf(c) >= 0; });
+  if(!temCfopCredito) return 0;
+
+  // Extrair valores e bases de cálculo
+  var impostos = nfe.impostos || {};
+  var vPIS = parseFloat(impostos.vPIS) || 0;
+  var vCOFINS = parseFloat(impostos.vCOFINS) || 0;
+  var vICMS = parseFloat(impostos.vICMS) || 0;
+  var vBC = parseFloat(impostos.vBC) || 0;       // Base de cálculo ICMS
+  var vProd = parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0; // Valor dos produtos (base PIS/COFINS)
+
+  // Se todos zerados, não gera
+  if(vPIS === 0 && vCOFINS === 0 && vICMS === 0) return 0;
+
+  // Verificar duplicata
+  var ctItems = getData('creditos_trib');
+  var nfeRef = String(nfe.numero||'');
+  var jaExiste = ctItems.some(function(ct){
+    return ct.nfRef === nfeRef && ct.fornecedor === nfe.fornecedor && ct._chaveNFe === nfe.chave;
+  });
+  if(jaExiste) return 0;
+
+  var competencia = nfe.emissao || '';
+  var fornecedor = nfe.fornecedor || '';
+  var cfopsStr = cfopsNFe.filter(function(c){ return _CFOPS_CREDITO.indexOf(c) >= 0; }).join(', ');
+  var count = 0;
+
+  // Calcular alíquotas efetivas
+  var aliqPIS = vProd > 0 ? (vPIS / vProd * 100) : 0;
+  var aliqCOFINS = vProd > 0 ? (vCOFINS / vProd * 100) : 0;
+  var aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
+
+  // Gerar crédito de PIS
+  if(vPIS > 0) {
+    ctItems.push({
+      imposto: 'PIS', natureza: 'Crédito', competencia: competencia,
+      valor: formatCurrency(vPIS), baseCalculo: formatCurrency(vProd),
+      aliquota: aliqPIS.toFixed(2)+'%',
+      nfRef: nfeRef, fornecedor: fornecedor,
+      descricao: 'PIS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')',
+      _chaveNFe: nfe.chave || '', _geradoAuto: true
+    });
+    count++;
+  }
+
+  // Gerar crédito de COFINS
+  if(vCOFINS > 0) {
+    ctItems.push({
+      imposto: 'COFINS', natureza: 'Crédito', competencia: competencia,
+      valor: formatCurrency(vCOFINS), baseCalculo: formatCurrency(vProd),
+      aliquota: aliqCOFINS.toFixed(2)+'%',
+      nfRef: nfeRef, fornecedor: fornecedor,
+      descricao: 'COFINS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')',
+      _chaveNFe: nfe.chave || '', _geradoAuto: true
+    });
+    count++;
+  }
+
+  // Gerar crédito de ICMS (próprio, não ST)
+  if(vICMS > 0) {
+    ctItems.push({
+      imposto: 'ICMS', natureza: 'Crédito', competencia: competencia,
+      valor: formatCurrency(vICMS), baseCalculo: formatCurrency(vBC),
+      aliquota: aliqICMS.toFixed(2)+'%',
+      nfRef: nfeRef, fornecedor: fornecedor,
+      descricao: 'ICMS próprio s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')',
+      _chaveNFe: nfe.chave || '', _geradoAuto: true
+    });
+    count++;
+  }
+
+  if(count > 0) {
+    setData('creditos_trib', ctItems);
+    console.log('[CreditosTrib] '+count+' crédito(s) gerado(s) para NF-e '+nfeRef+' de '+fornecedor);
+  }
+
+  return count;
 }
 
 
@@ -2663,19 +2865,25 @@ function pesquisarCT() {
     var val = parseCurrency(item.valor);
     var isCred = item.natureza === 'Crédito';
     var impColor = item.imposto==='ICMS'?'#1a5276':item.imposto==='PIS'?'#e67e22':'#6f42c1';
+    var baseCalc = item.baseCalculo ? formatCurrency(parseCurrency(item.baseCalculo)) : '';
+    var aliq = item.aliquota || '';
+    var origemBadge = item._geradoAuto ? '<span style="background:#e8f4fd;color:#1a5276;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;">AUTO</span>' : '';
     return '<tr>'+
       '<td><span style="background:'+impColor+';color:white;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;">'+item.imposto+'</span></td>'+
       '<td>'+formatDateBR(item.competencia)+'</td>'+
       '<td><span style="background:'+(isCred?'#d4edda':'#f8d7da')+';color:'+(isCred?'#155724':'#721c24')+';padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;">'+(isCred?'⬆ Crédito':'⬇ Débito')+'</span></td>'+
+      '<td style="text-align:right;color:#888;font-size:11px;">'+baseCalc+'</td>'+
+      '<td style="text-align:center;font-weight:700;color:'+impColor+';">'+aliq+'</td>'+
       '<td style="text-align:right;font-weight:bold;color:'+(isCred?'#28a745':'#dc3545')+';">'+formatCurrency(val)+'</td>'+
       '<td>'+(item.nfRef||'')+'</td>'+
       '<td>'+(item.fornecedor||'')+'</td>'+
-      '<td>'+(item.descricao||'')+'</td>'+
+      '<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(item.descricao||'')+'">'+(item.descricao||'')+'</td>'+
+      '<td>'+origemBadge+'</td>'+
       '<td style="white-space:nowrap;"><button class="btn-secondary" onclick="editarCT('+realIdx+')" style="padding:2px 6px;font-size:11px;">✏️</button> <button style="background:#dc3545;color:white;border:none;padding:2px 6px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="deletarCT('+realIdx+')">🗑️</button></td></tr>';
   }).join('');
 
-  html += '<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Imposto</th><th>Competência</th><th>Natureza</th><th style="text-align:right">Valor</th><th>NF Ref.</th><th>Fornecedor</th><th>Descrição</th><th>Ações</th></tr></thead><tbody>'+rows;
-  if(items.length===0) html += '<tr><td colspan="8" style="text-align:center;color:#888;padding:20px;">Nenhum lançamento encontrado. Clique em + NOVO LANÇAMENTO para começar.</td></tr>';
+  html += '<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Imposto</th><th>Competência</th><th>Natureza</th><th style="text-align:right">Base Cálculo</th><th style="text-align:center">Alíquota</th><th style="text-align:right">Valor</th><th>NF Ref.</th><th>Fornecedor</th><th>Descrição</th><th>Origem</th><th>Ações</th></tr></thead><tbody>'+rows;
+  if(items.length===0) html += '<tr><td colspan="11" style="text-align:center;color:#888;padding:20px;">Nenhum lançamento encontrado. Clique em + NOVO LANÇAMENTO para começar.</td></tr>';
   html += '</tbody></table></div>';
 
   html += '<div class="action-bar"><div class="left">'+
@@ -2729,8 +2937,8 @@ function deletarCT(idx) { if(!confirm('Excluir este lançamento?'))return; var i
 function exportarCT() {
   var items = window._ctFilteredItems || getData('creditos_trib');
   if(items.length===0){ showToast('Nenhum lançamento!',true); return; }
-  var headers = ['Imposto','Natureza','Competencia','Valor','NF Referencia','Fornecedor','Descricao'];
-  var rows = items.map(function(i){ return [i.imposto,i.natureza,formatDateBR(i.competencia),i.valor,i.nfRef||'',i.fornecedor||'',i.descricao||'']; });
+  var headers = ['Imposto','Natureza','Competencia','Base Calculo','Aliquota','Valor','NF Referencia','Fornecedor','Descricao','Origem'];
+  var rows = items.map(function(i){ return [i.imposto,i.natureza,formatDateBR(i.competencia),i.baseCalculo||'',i.aliquota||'',i.valor,i.nfRef||'',i.fornecedor||'',i.descricao||'',i._geradoAuto?'Automático':'Manual']; });
   exportXLS('creditos_tributarios_'+getToday()+'.xls', headers, rows);
   showToast('📤 Exportado!');
 }
