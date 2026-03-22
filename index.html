@@ -1830,9 +1830,10 @@ function parseNFeXML(xmlText, fileName) {
     vBCST = getTagText(icmsTot[0], 'vBCST');
   }
 
-  // produtos (det)
+  // produtos (det) + somar bases reais de PIS/COFINS dos itens
   var dets = getTag(infNFe, 'det');
   var produtos = [];
+  var somaBcPIS=0, somaBcCOFINS=0, aliqPISItem=0, aliqCOFINSItem=0;
   for(var d=0; d<dets.length; d++) {
     var det = dets[d];
     var prod = getTag(det, 'prod');
@@ -1847,6 +1848,22 @@ function parseNFeXML(xmlText, fileName) {
         vUnit: getTagText(prod[0], 'vUnCom'),
         vTotal: getTagText(prod[0], 'vProd')
       });
+    }
+    // Extrair base PIS do item (PISAliq/PISOutr → vBC)
+    var pisNode = getTag(det, 'PIS');
+    if(pisNode.length>0) {
+      var bcP = parseFloat(getTagText(pisNode[0], 'vBC')) || 0;
+      var alP = parseFloat(getTagText(pisNode[0], 'pPIS')) || 0;
+      somaBcPIS += bcP;
+      if(alP > 0) aliqPISItem = alP;
+    }
+    // Extrair base COFINS do item (COFINSAliq/COFINSOutr → vBC)
+    var cofNode = getTag(det, 'COFINS');
+    if(cofNode.length>0) {
+      var bcC = parseFloat(getTagText(cofNode[0], 'vBC')) || 0;
+      var alC = parseFloat(getTagText(cofNode[0], 'pCOFINS')) || 0;
+      somaBcCOFINS += bcC;
+      if(alC > 0) aliqCOFINSItem = alC;
     }
   }
 
@@ -1878,7 +1895,7 @@ function parseNFeXML(xmlText, fileName) {
     valor: valorTotal,
     chave: chave,
     natOp: natOp,
-    impostos: {vICMS:vICMS, vPIS:vPIS, vCOFINS:vCOFINS, vIPI:vIPI, vST:vST, vFrete:vFrete, vDesc:vDesc, vBC:vBC, vProd:vProd, vBCST:vBCST},
+    impostos: {vICMS:vICMS, vPIS:vPIS, vCOFINS:vCOFINS, vIPI:vIPI, vST:vST, vFrete:vFrete, vDesc:vDesc, vBC:vBC, vProd:vProd, vBCST:vBCST, bcPIS:String(somaBcPIS), bcCOFINS:String(somaBcCOFINS), pPIS:String(aliqPISItem), pCOFINS:String(aliqCOFINSItem)},
     produtos: produtos,
     duplicatas: duplicatas,
     infCpl: infCpl,
@@ -2096,7 +2113,13 @@ function gerarCreditosTribFromNFe(nfe) {
   var vCOFINS = parseFloat(impostos.vCOFINS) || 0;
   var vICMS = parseFloat(impostos.vICMS) || 0;
   var vBC = parseFloat(impostos.vBC) || 0;       // Base de cálculo ICMS
-  var vProd = parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0; // Valor dos produtos (base PIS/COFINS)
+
+  // Bases reais de PIS/COFINS (extraídas dos itens, excluem ICMS da base)
+  var bcPIS = parseFloat(impostos.bcPIS) || 0;
+  var bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
+  // Alíquotas reais dos itens (pPIS e pCOFINS)
+  var pPIS = parseFloat(impostos.pPIS) || 0;
+  var pCOFINS = parseFloat(impostos.pCOFINS) || 0;
 
   // Se todos zerados, não gera
   if(vPIS === 0 && vCOFINS === 0 && vICMS === 0) return 0;
@@ -2114,16 +2137,20 @@ function gerarCreditosTribFromNFe(nfe) {
   var cfopsStr = cfopsNFe.filter(function(c){ return _CFOPS_CREDITO.indexOf(c) >= 0; }).join(', ');
   var count = 0;
 
-  // Calcular alíquotas efetivas
-  var aliqPIS = vProd > 0 ? (vPIS / vProd * 100) : 0;
-  var aliqCOFINS = vProd > 0 ? (vCOFINS / vProd * 100) : 0;
+  // Alíquotas: priorizar a do XML (pPIS/pCOFINS), senão calcular pela base real
+  var aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS / bcPIS * 100) : 0);
+  var aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS / bcCOFINS * 100) : 0);
   var aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
+
+  // Bases para exibição: usar base real dos itens quando disponível
+  var basePISExib = bcPIS > 0 ? bcPIS : (parseFloat(impostos.vProd) || parseCurrency(nfe.valor) || 0);
+  var baseCOFINSExib = bcCOFINS > 0 ? bcCOFINS : (parseFloat(impostos.vProd) || parseCurrency(nfe.valor) || 0);
 
   // Gerar crédito de PIS
   if(vPIS > 0) {
     ctItems.push({
       imposto: 'PIS', natureza: 'Crédito', competencia: competencia,
-      valor: formatCurrency(vPIS), baseCalculo: formatCurrency(vProd),
+      valor: formatCurrency(vPIS), baseCalculo: formatCurrency(basePISExib),
       aliquota: aliqPIS.toFixed(2)+'%',
       nfRef: nfeRef, fornecedor: fornecedor,
       descricao: 'PIS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')',
@@ -2136,7 +2163,7 @@ function gerarCreditosTribFromNFe(nfe) {
   if(vCOFINS > 0) {
     ctItems.push({
       imposto: 'COFINS', natureza: 'Crédito', competencia: competencia,
-      valor: formatCurrency(vCOFINS), baseCalculo: formatCurrency(vProd),
+      valor: formatCurrency(vCOFINS), baseCalculo: formatCurrency(baseCOFINSExib),
       aliquota: aliqCOFINS.toFixed(2)+'%',
       nfRef: nfeRef, fornecedor: fornecedor,
       descricao: 'COFINS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')',
@@ -2166,6 +2193,118 @@ function gerarCreditosTribFromNFe(nfe) {
   return count;
 }
 
+function reprocessarNFeCreditosAuto() {
+  var nfes = getData('notas_fiscais');
+  if(nfes.length === 0) { showToast('Nenhuma NF-e cadastrada no sistema.', true); return; }
+
+  var cnpjMBDJ = '44578505000103';
+  var ctItems = getData('creditos_trib');
+  var countGerados = 0;
+  var countPulados = 0;
+  var countSemImposto = 0;
+  var detalhes = [];
+
+  nfes.forEach(function(nfe) {
+    // Determinar se é entrada — verificar tipoOperacao OU inferir pelo CFOP/emitente
+    var ehEntrada = false;
+    if(nfe.tipoOperacao === 'entrada') {
+      ehEntrada = true;
+    } else if(!nfe.tipoOperacao) {
+      // NF-e antiga sem tipoOperacao — inferir pelo emitente
+      var emitCNPJ = (nfe.emitenteCNPJ || nfe.cnpj || '').replace(/[.\-\/]/g, '');
+      if(emitCNPJ && emitCNPJ !== cnpjMBDJ) {
+        ehEntrada = true; // Outro emitiu → é compra
+      } else {
+        // Sem emitente, tentar pelo CFOP
+        var cfops = (nfe.produtos||[]).map(function(p){ return String(p.cfop||''); });
+        ehEntrada = cfops.some(function(c){ return c.startsWith('1')||c.startsWith('2')||c.startsWith('5401')||c.startsWith('5403')||c.startsWith('6401')||c.startsWith('6403'); });
+      }
+    }
+    if(!ehEntrada) return;
+
+    // Verificar CFOP de crédito
+    var cfopsNFe = (nfe.produtos||[]).map(function(p){ return String(p.cfop||''); });
+    var temCfopCredito = cfopsNFe.some(function(c){ return _CFOPS_CREDITO.indexOf(c) >= 0; });
+    if(!temCfopCredito) return;
+
+    // Verificar duplicata
+    var nfeRef = String(nfe.numero||'');
+    var chaveNfe = nfe.chave || '';
+    var jaExiste = ctItems.some(function(ct){
+      return ct.nfRef === nfeRef && (ct._chaveNFe === chaveNfe || (!ct._chaveNFe && ct.fornecedor === nfe.fornecedor));
+    });
+    if(jaExiste) { countPulados++; return; }
+
+    // Extrair impostos — pode vir do campo impostos OU não existir
+    var impostos = nfe.impostos || {};
+    var vPIS = parseFloat(impostos.vPIS) || 0;
+    var vCOFINS = parseFloat(impostos.vCOFINS) || 0;
+    var vICMS = parseFloat(impostos.vICMS) || 0;
+    var vBC = parseFloat(impostos.vBC) || 0;
+
+    // Bases reais PIS/COFINS (dos itens, excluem ICMS da base)
+    var bcPIS = parseFloat(impostos.bcPIS) || 0;
+    var bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
+    var pPIS = parseFloat(impostos.pPIS) || 0;
+    var pCOFINS = parseFloat(impostos.pCOFINS) || 0;
+
+    if(vPIS === 0 && vCOFINS === 0 && vICMS === 0) { countSemImposto++; return; }
+
+    var competencia = nfe.emissao || '';
+    var fornecedor = nfe.fornecedor || '';
+    var cfopsStr = cfopsNFe.filter(function(c){ return _CFOPS_CREDITO.indexOf(c) >= 0; }).join(', ');
+
+    // Alíquotas: priorizar a do XML, senão calcular pela base real
+    var aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS / bcPIS * 100) : 0);
+    var aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS / bcCOFINS * 100) : 0);
+    var aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
+    var basePISExib = bcPIS > 0 ? bcPIS : (parseFloat(impostos.vProd) || parseCurrency(nfe.valor) || 0);
+    var baseCOFINSExib = bcCOFINS > 0 ? bcCOFINS : (parseFloat(impostos.vProd) || parseCurrency(nfe.valor) || 0);
+
+    var nfeCount = 0;
+    if(vPIS > 0) {
+      ctItems.push({ imposto:'PIS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vPIS), baseCalculo:formatCurrency(basePISExib), aliquota:aliqPIS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'PIS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      nfeCount++;
+    }
+    if(vCOFINS > 0) {
+      ctItems.push({ imposto:'COFINS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vCOFINS), baseCalculo:formatCurrency(baseCOFINSExib), aliquota:aliqCOFINS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'COFINS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      nfeCount++;
+    }
+    if(vICMS > 0) {
+      ctItems.push({ imposto:'ICMS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vICMS), baseCalculo:formatCurrency(vBC), aliquota:aliqICMS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'ICMS próprio s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      nfeCount++;
+    }
+
+    if(nfeCount > 0) {
+      countGerados += nfeCount;
+      detalhes.push('NF-e '+nfeRef+' ('+fornecedor+'): '+nfeCount+' crédito(s)');
+    }
+  });
+
+  if(countGerados > 0) {
+    setData('creditos_trib', ctItems);
+    pesquisarCT();
+  }
+
+  // Montar mensagem detalhada
+  var msg = '';
+  if(countGerados > 0) {
+    msg = '✅ '+countGerados+' crédito(s) gerado(s) de '+detalhes.length+' NF-e(s)!';
+  } else {
+    msg = 'Nenhum crédito novo gerado.';
+  }
+  if(countPulados > 0) msg += ' | '+countPulados+' NF-e(s) já tinham créditos.';
+  if(countSemImposto > 0) msg += ' | ⚠️ '+countSemImposto+' NF-e(s) com CFOP de crédito mas sem valores de imposto no XML.';
+
+  if(countSemImposto > 0 && countGerados === 0) {
+    showToast(msg + ' Reimporte os XMLs dessas notas para carregar os impostos.', true);
+  } else {
+    showToast(msg);
+  }
+
+  // Log detalhado no console
+  console.log('[ReprocessarCT] Resultado:', { gerados:countGerados, pulados:countPulados, semImposto:countSemImposto, detalhes:detalhes });
+}
 
 // ============================================================
 // === FLUXO DE CAIXA ===
@@ -2814,7 +2953,63 @@ function renderCreditosTrib() {
     '<div><label>Período até:</label><input type="month" id="ct-mes-ate" value="'+mesAtual+'"></div>'+
     '<div><label>Imposto:</label><select id="ct-imposto"><option value="">Todos</option><option value="ICMS">ICMS</option><option value="PIS">PIS</option><option value="COFINS">COFINS</option></select></div></div>'+
     '<div style="display:flex;gap:8px;"><button class="btn-secondary" onclick="limparFiltrosCT()">Limpar</button><button class="btn-primary" onclick="pesquisarCT()">Pesquisar</button></div></div>'+
+    // Painel de Projeção Tributária
+    '<div style="background:white;border:1px solid #1a5276;border-radius:10px;overflow:hidden;margin-bottom:16px;">'+
+      '<div style="background:#1a5276;color:white;padding:10px 14px;font-size:13px;font-weight:700;display:flex;justify-content:space-between;align-items:center;">'+
+        '<span>📊 Projeção Tributária do Mês</span>'+
+        '<span style="font-size:10px;opacity:0.7;">ICMS 18% · PIS 1,65% · COFINS 7,60%</span>'+
+      '</div>'+
+      '<div style="padding:16px;">'+
+        // Linha 1: Inputs editáveis
+        '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:14px;">'+
+          '<div><label style="font-size:10px;color:#666;font-weight:700;text-transform:uppercase;">💰 Vendas Brutas Projetadas</label>'+
+            '<input type="text" id="ct-vendas-proj" placeholder="Ex: 500.000,00" style="width:100%;padding:8px 10px;border:2px solid #1a5276;border-radius:6px;font-size:14px;font-weight:700;color:#1a5276;margin-top:3px;" oninput="calcularDebitosProjetados()" onkeyup="calcularDebitosProjetados()"></div>'+
+          '<div><label style="font-size:10px;color:#1a5276;font-weight:700;text-transform:uppercase;">Saldo Inicial ICMS</label>'+
+            '<input type="text" id="ct-saldo-ini-icms" placeholder="R$ 0,00" style="width:100%;padding:8px 10px;border:1px solid #1a5276;border-radius:6px;font-size:13px;font-weight:600;color:#1a5276;margin-top:3px;" oninput="calcularDebitosProjetados()" onkeyup="calcularDebitosProjetados()"></div>'+
+          '<div><label style="font-size:10px;color:#e67e22;font-weight:700;text-transform:uppercase;">Saldo Inicial PIS</label>'+
+            '<input type="text" id="ct-saldo-ini-pis" placeholder="R$ 0,00" style="width:100%;padding:8px 10px;border:1px solid #e67e22;border-radius:6px;font-size:13px;font-weight:600;color:#e67e22;margin-top:3px;" oninput="calcularDebitosProjetados()" onkeyup="calcularDebitosProjetados()"></div>'+
+          '<div><label style="font-size:10px;color:#6f42c1;font-weight:700;text-transform:uppercase;">Saldo Inicial COFINS</label>'+
+            '<input type="text" id="ct-saldo-ini-cofins" placeholder="R$ 0,00" style="width:100%;padding:8px 10px;border:1px solid #6f42c1;border-radius:6px;font-size:13px;font-weight:600;color:#6f42c1;margin-top:3px;" oninput="calcularDebitosProjetados()" onkeyup="calcularDebitosProjetados()"></div>'+
+        '</div>'+
+        '<div style="text-align:right;margin-bottom:10px;"><button onclick="salvarSaldosIniciaisCT()" style="background:#1a5276;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">💾 Salvar saldos iniciais</button></div>'+
+        // Cards de composição (4 colunas)
+        '<div id="ct-cards-composicao" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;"></div>'+
+        // Insight de compra (abaixo, largura total)
+        '<div style="background:white;border:1px solid #e0e0e0;border-radius:10px;overflow:hidden;margin-top:14px;">'+
+          '<div style="background:linear-gradient(135deg,#fffbeb,#fef3c7);padding:10px 16px;border-bottom:1px solid #fde68a;display:flex;justify-content:space-between;align-items:center;">'+
+            '<span style="font-size:14px;font-weight:800;color:#92400e;">💡 Insight de Compra — Sugestão para o Gestor</span>'+
+            '<span style="font-size:9px;color:#a16207;background:rgba(146,64,14,0.1);padding:3px 8px;border-radius:4px;">Base PIS/COFINS = compra − 18% ICMS (padrão SIL)</span>'+
+          '</div>'+
+          '<div style="padding:16px;">'+
+            '<div style="display:grid;grid-template-columns:1fr 1px 1fr;gap:0;">'+
+              '<div id="ct-insight-sugestao" style="padding-right:20px;"></div>'+
+              '<div style="background:#e0e0e0;"></div>'+
+              '<div style="padding-left:20px;">'+
+                '<div style="font-size:11px;font-weight:700;color:#4338ca;text-transform:uppercase;margin-bottom:10px;">🔮 Simular Compra Personalizada</div>'+
+                '<div style="margin-bottom:10px;">'+
+                  '<label style="font-size:10px;color:#666;font-weight:600;">Valor da compra (R$):</label>'+
+                  '<input type="text" id="ct-sim-compra" placeholder="Ex: 350.000,00" style="width:100%;padding:10px;border:2px solid #6366f1;border-radius:8px;font-size:15px;font-weight:700;color:#4338ca;margin-top:4px;" oninput="atualizarSimulacao()" onkeyup="atualizarSimulacao()">'+
+                '</div>'+
+                '<div id="ct-sim-resultado"></div>'+
+              '</div>'+
+            '</div>'+
+          '</div>'+
+        '</div>'+
+      '</div>'+
+    '</div>'+
     '<div id="ct-results"></div>';
+  // Carregar saldos iniciais salvos
+  var _ctSaldos = getConfigItem('ct_saldos_iniciais');
+  if(_ctSaldos) {
+    try {
+      var s = JSON.parse(_ctSaldos);
+      if(s.icms) document.getElementById('ct-saldo-ini-icms').value = s.icms;
+      if(s.pis) document.getElementById('ct-saldo-ini-pis').value = s.pis;
+      if(s.cofins) document.getElementById('ct-saldo-ini-cofins').value = s.cofins;
+      if(s.vendas) document.getElementById('ct-vendas-proj').value = s.vendas;
+    } catch(e){}
+  }
+  calcularDebitosProjetados();
   pesquisarCT();
 }
 
@@ -2830,33 +3025,8 @@ function pesquisarCT() {
   if(imposto) items = items.filter(function(i){ return i.imposto === imposto; });
   items.sort(function(a,b){ return (a.competencia||'').localeCompare(b.competencia||'') || (a.imposto||'').localeCompare(b.imposto||''); });
 
-  // Calcular saldos por imposto
-  var saldos = {ICMS:{cred:0,deb:0},PIS:{cred:0,deb:0},COFINS:{cred:0,deb:0}};
-  items.forEach(function(i){
-    if(saldos[i.imposto]) {
-      if(i.natureza==='Crédito') saldos[i.imposto].cred += parseCurrency(i.valor);
-      else saldos[i.imposto].deb += parseCurrency(i.valor);
-    }
-  });
-
-  // Cards de saldo
-  var html = '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:15px;">';
-  ['ICMS','PIS','COFINS'].forEach(function(imp){
-    if(imposto && imposto !== imp) return;
-    var s = saldos[imp];
-    var saldo = s.cred - s.deb;
-    var cor = saldo >= 0 ? '#28a745' : '#dc3545';
-    var corBg = saldo >= 0 ? '#d4edda' : '#f8d7da';
-    html += '<div style="background:white;border:1px solid #ddd;border-radius:8px;padding:15px;border-top:3px solid '+(imp==='ICMS'?'#1a5276':imp==='PIS'?'#e67e22':'#6f42c1')+';">';
-    html += '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;">'+imp+'</div>';
-    html += '<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px;"><span style="color:#28a745;">Créditos:</span><span style="color:#28a745;font-weight:bold;">'+formatCurrency(s.cred)+'</span></div>';
-    html += '<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px;"><span style="color:#dc3545;">Débitos:</span><span style="color:#dc3545;font-weight:bold;">'+formatCurrency(s.deb)+'</span></div>';
-    html += '<div style="background:'+corBg+';padding:6px 10px;border-radius:4px;margin-top:6px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:11px;font-weight:bold;">Saldo:</span><span style="font-size:16px;font-weight:bold;color:'+cor+';">'+formatCurrency(saldo)+'</span></div>';
-    html += '</div>';
-  });
-  html += '</div>';
-
   // Tabela de lançamentos
+  var html = '';
   window._ctFilteredItems = items;
   window._ctFilteredIdxMap = items.map(function(item){ return allItems.indexOf(item); });
 
@@ -2888,13 +3058,217 @@ function pesquisarCT() {
 
   html += '<div class="action-bar"><div class="left">'+
     '<button class="btn-primary" onclick="criarCT()">+ NOVO LANÇAMENTO</button>'+
+    '<button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;" onclick="showImportXMLCreditos()">📄 IMPORTAR XML</button>'+
+    '<button style="background:#8e44ad;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;" onclick="reprocessarNFeCreditosAuto()">🔄 GERAR CRÉDITOS DAS NF-e</button>'+
     '<button style="background:#17a2b8;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="exportarCT()">📤 EXPORTAR EXCEL</button>'+
+    '<span style="color:#ccc;font-size:11px;">|</span>'+
+    '<button style="background:#dc3545;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;" onclick="zerarCreditosTrib()">🗑️ ZERAR TUDO</button>'+
   '</div><div class="right">'+items.length+' lançamentos</div></div>';
 
   document.getElementById('ct-results').innerHTML = html;
+  calcularDebitosProjetados();
 }
 
 function limparFiltrosCT(){ var h=getToday().substring(0,7); document.getElementById('ct-mes-de').value=h; document.getElementById('ct-mes-ate').value=h; document.getElementById('ct-imposto').value=''; pesquisarCT(); }
+
+function calcularDebitosProjetados() {
+  var cardsEl = document.getElementById('ct-cards-composicao');
+  if(!cardsEl) return;
+
+  // Ler inputs
+  var vendas = parseCurrency(document.getElementById('ct-vendas-proj') ? document.getElementById('ct-vendas-proj').value : '0');
+  var saldoIniICMS = parseCurrency(document.getElementById('ct-saldo-ini-icms') ? document.getElementById('ct-saldo-ini-icms').value : '0');
+  var saldoIniPIS = parseCurrency(document.getElementById('ct-saldo-ini-pis') ? document.getElementById('ct-saldo-ini-pis').value : '0');
+  var saldoIniCOFINS = parseCurrency(document.getElementById('ct-saldo-ini-cofins') ? document.getElementById('ct-saldo-ini-cofins').value : '0');
+
+  // Débitos projetados
+  var debICMS = vendas * 0.18;
+  var debPIS = vendas * 0.0165;
+  var debCOFINS = vendas * 0.076;
+
+  // Créditos do período (NF-e do mês)
+  var allItems = getData('creditos_trib');
+  var mesDE = document.getElementById('ct-mes-de') ? document.getElementById('ct-mes-de').value : '';
+  var mesATE = document.getElementById('ct-mes-ate') ? document.getElementById('ct-mes-ate').value : '';
+  var credNfICMS=0, credNfPIS=0, credNfCOFINS=0;
+  allItems.forEach(function(i){
+    if(i.natureza !== 'Crédito') return;
+    var comp = (i.competencia||'').substring(0,7);
+    if(mesDE && comp < mesDE) return;
+    if(mesATE && comp > mesATE) return;
+    var val = parseCurrency(i.valor);
+    if(i.imposto==='ICMS') credNfICMS += val;
+    if(i.imposto==='PIS') credNfPIS += val;
+    if(i.imposto==='COFINS') credNfCOFINS += val;
+  });
+
+  // Saldo final = Saldo Inicial + Créditos NF - Débitos
+  var saldoICMS = saldoIniICMS + credNfICMS - debICMS;
+  var saldoPIS = saldoIniPIS + credNfPIS - debPIS;
+  var saldoCOFINS = saldoIniCOFINS + credNfCOFINS - debCOFINS;
+
+  function corV(v) { return v >= 0 ? '#28a745' : '#dc3545'; }
+  function bgV(v) { return v >= 0 ? '#d4edda' : '#f8d7da'; }
+  function lbl(v) { return v >= 0 ? '✅ Crédito acumulado' : '🔴 A recolher'; }
+  function linha(label, valor, cor, bold, icon) {
+    return '<div style="display:flex;justify-content:space-between;padding:3px 0;'+(bold?'font-weight:700;':'')+'">'+
+      '<span style="color:#555;font-size:11px;">'+(icon||'')+' '+label+'</span>'+
+      '<span style="color:'+cor+';font-size:11px;font-weight:'+(bold?'800':'600')+';">'+formatCurrency(Math.abs(valor))+'</span></div>';
+  }
+
+  function renderCard(imp, cor, saldoIni, credNf, deb, saldo) {
+    var h = '<div style="background:white;border:1px solid #ddd;border-radius:10px;overflow:hidden;border-top:3px solid '+cor+';">';
+    h += '<div style="padding:10px 14px;background:#fafafa;border-bottom:1px solid #eee;"><div style="font-size:14px;font-weight:800;color:'+cor+';">'+imp+'</div></div>';
+    h += '<div style="padding:10px 14px;">';
+    h += linha('Saldo inicial', saldoIni, saldoIni >= 0 ? '#28a745' : '#dc3545', false, '📋');
+    h += linha('Créditos NF-e mês', credNf, '#28a745', false, '➕');
+    h += '<div style="border-top:1px dashed #ddd;margin:4px 0;"></div>';
+    h += linha('Débitos projetados', deb, '#dc3545', false, '➖');
+    h += '<div style="border-top:2px solid #ddd;margin:6px 0;"></div>';
+    h += '<div style="padding:6px 10px;border-radius:6px;background:'+bgV(saldo)+';text-align:center;margin-top:4px;">';
+    h += '<div style="font-size:10px;color:'+corV(saldo)+';font-weight:600;">'+lbl(saldo)+'</div>';
+    h += '<div style="font-size:20px;font-weight:800;color:'+corV(saldo)+';">'+formatCurrency(Math.abs(saldo))+'</div>';
+    h += '</div>';
+    h += '</div></div>';
+    return h;
+  }
+
+  // Totais
+  var totalSaldoIni = saldoIniICMS + saldoIniPIS + saldoIniCOFINS;
+  var totalCredNf = credNfICMS + credNfPIS + credNfCOFINS;
+  var totalDeb = debICMS + debPIS + debCOFINS;
+  var totalSaldo = saldoICMS + saldoPIS + saldoCOFINS;
+
+  var html = '';
+  html += renderCard('ICMS', '#1a5276', saldoIniICMS, credNfICMS, debICMS, saldoICMS);
+  html += renderCard('PIS', '#e67e22', saldoIniPIS, credNfPIS, debPIS, saldoPIS);
+  html += renderCard('COFINS', '#6f42c1', saldoIniCOFINS, credNfCOFINS, debCOFINS, saldoCOFINS);
+
+  // Card TOTAL
+  html += '<div style="background:white;border:1px solid #ddd;border-radius:10px;overflow:hidden;border-top:3px solid #333;">';
+  html += '<div style="padding:10px 14px;background:#fafafa;border-bottom:1px solid #eee;"><div style="font-size:14px;font-weight:800;color:#333;">TOTAL</div></div>';
+  html += '<div style="padding:10px 14px;">';
+  html += linha('Saldo inicial', totalSaldoIni, totalSaldoIni >= 0 ? '#28a745' : '#dc3545', false, '📋');
+  html += linha('Créditos NF-e mês', totalCredNf, '#28a745', false, '➕');
+  html += '<div style="border-top:1px dashed #ddd;margin:4px 0;"></div>';
+  html += linha('Débitos projetados', totalDeb, '#dc3545', false, '➖');
+  html += '<div style="border-top:2px solid #ddd;margin:6px 0;"></div>';
+  html += '<div style="padding:8px 10px;border-radius:6px;background:'+bgV(totalSaldo)+';text-align:center;margin-top:4px;">';
+  html += '<div style="font-size:10px;color:'+corV(totalSaldo)+';font-weight:600;">'+lbl(totalSaldo)+'</div>';
+  html += '<div style="font-size:24px;font-weight:800;color:'+corV(totalSaldo)+';">'+formatCurrency(Math.abs(totalSaldo))+'</div>';
+  html += '</div>';
+  if(vendas > 0) {
+    var aliqEfetiva = (totalDeb / vendas * 100);
+    html += '<div style="margin-top:6px;text-align:center;font-size:10px;color:#888;">Carga: <strong>'+aliqEfetiva.toFixed(2)+'%</strong> s/ '+formatCurrency(vendas)+'</div>';
+  }
+  html += '</div></div>';
+
+  cardsEl.innerHTML = html;
+
+  // === ATUALIZAR SUGESTÃO ===
+  var sugEl = document.getElementById('ct-insight-sugestao');
+  if(sugEl) {
+    var txICMS = 0.18;
+    var txPIS = 0.82 * 0.0165;
+    var txCOFINS = 0.82 * 0.076;
+    var txTotal = txICMS + txPIS + txCOFINS;
+
+    var defICMS = Math.max(0, debICMS - saldoIniICMS - credNfICMS);
+    var defPIS = Math.max(0, debPIS - saldoIniPIS - credNfPIS);
+    var defCOFINS = Math.max(0, debCOFINS - saldoIniCOFINS - credNfCOFINS);
+
+    var compraMinICMS = txICMS > 0 ? defICMS / txICMS : 0;
+    var compraMinPIS = txPIS > 0 ? defPIS / txPIS : 0;
+    var compraMinCOFINS = txCOFINS > 0 ? defCOFINS / txCOFINS : 0;
+    var compraMinima = Math.max(compraMinICMS, compraMinPIS, compraMinCOFINS);
+    var gargalo = compraMinICMS >= compraMinPIS && compraMinICMS >= compraMinCOFINS ? 'ICMS' : (compraMinPIS >= compraMinCOFINS ? 'PIS' : 'COFINS');
+
+    window._ctProj = {saldoICMS:saldoICMS,saldoPIS:saldoPIS,saldoCOFINS:saldoCOFINS,totalSaldo:totalSaldo,compraMinima:compraMinima,txICMS:txICMS,txPIS:txPIS,txCOFINS:txCOFINS,txTotal:txTotal};
+
+    var sh = '<div style="font-size:11px;font-weight:700;color:#92400e;text-transform:uppercase;margin-bottom:10px;">📋 Pedido Mínimo Sugerido</div>';
+
+    if(vendas <= 0) {
+      sh += '<div style="background:#fffbeb;border:1px dashed #fde68a;border-radius:8px;padding:20px;text-align:center;">';
+      sh += '<div style="font-size:20px;margin-bottom:6px;">📊</div>';
+      sh += '<div style="font-size:12px;color:#92400e;font-weight:600;">Preencha as vendas projetadas</div>';
+      sh += '<div style="font-size:10px;color:#a16207;margin-top:4px;">Informe a projeção de vendas brutas do mês acima.</div>';
+      sh += '</div>';
+    } else if(totalSaldo >= 0) {
+      sh += '<div style="background:#d4edda;border-radius:8px;padding:16px;text-align:center;">';
+      sh += '<div style="font-size:28px;margin-bottom:4px;">✅</div>';
+      sh += '<div style="font-size:13px;font-weight:700;color:#155724;">Posição credora</div>';
+      sh += '<div style="font-size:11px;color:#155724;margin-top:4px;">Sem necessidade de compra adicional este mês.</div>';
+      sh += '<div style="font-size:11px;color:#155724;margin-top:2px;">Saldo positivo: <strong>'+formatCurrency(totalSaldo)+'</strong></div>';
+      sh += '</div>';
+    } else {
+      sh += '<div style="background:linear-gradient(135deg,#fff7ed,#ffedd5);border:2px solid #f97316;border-radius:10px;padding:14px;text-align:center;margin-bottom:10px;">';
+      sh += '<div style="font-size:10px;color:#9a3412;font-weight:600;margin-bottom:4px;">COMPRA MÍNIMA PARA ZERAR DÉBITOS</div>';
+      sh += '<div style="font-size:30px;font-weight:800;color:#ea580c;letter-spacing:-1px;">'+formatCurrency(compraMinima)+'</div>';
+      sh += '</div>';
+      sh += '<div style="font-size:10px;color:#666;margin-bottom:6px;">Essa compra geraria:</div>';
+      sh += '<table style="width:100%;font-size:11px;border-collapse:collapse;">';
+      sh += '<tr style="background:#f8f9fa;"><th style="padding:5px 8px;text-align:left;font-weight:600;color:#888;">Imposto</th><th style="padding:5px 8px;text-align:right;font-weight:600;color:#888;">Déficit</th><th style="padding:5px 8px;text-align:right;font-weight:600;color:#888;">Crédito</th><th style="padding:5px 8px;text-align:right;font-weight:600;color:#888;">Resultado</th></tr>';
+      function sugR(imp,cor,def,cred){var r=cred-def;return '<tr style="border-bottom:1px solid #f0f0f0;"><td style="padding:4px 8px;font-weight:700;color:'+cor+';">'+imp+'</td><td style="padding:4px 8px;text-align:right;color:#dc3545;">'+formatCurrency(def)+'</td><td style="padding:4px 8px;text-align:right;color:#28a745;">'+formatCurrency(cred)+'</td><td style="padding:4px 8px;text-align:right;font-weight:700;color:'+(r>=0?'#28a745':'#dc3545')+';">'+formatCurrency(Math.abs(r))+'</td></tr>';}
+      sh += sugR('ICMS','#1a5276',defICMS,compraMinima*txICMS);
+      sh += sugR('PIS','#e67e22',defPIS,compraMinima*txPIS);
+      sh += sugR('COFINS','#6f42c1',defCOFINS,compraMinima*txCOFINS);
+      sh += '</table>';
+      sh += '<div style="display:flex;justify-content:space-between;margin-top:8px;font-size:9px;color:#888;">';
+      sh += '<span>Gargalo: <strong style="color:#ea580c;">'+gargalo+'</strong></span>';
+      sh += '<span>Crédito total: <strong>'+(txTotal*100).toFixed(2)+'%</strong> por R$ comprado</span>';
+      sh += '</div>';
+    }
+    sugEl.innerHTML = sh;
+  }
+  atualizarSimulacao();
+}
+
+function atualizarSimulacao() {
+  var resEl = document.getElementById('ct-sim-resultado');
+  if(!resEl) return;
+  var simInput = document.getElementById('ct-sim-compra');
+  var simValor = simInput ? parseCurrency(simInput.value) : 0;
+  var p = window._ctProj || {};
+  var saldoICMS=p.saldoICMS||0, saldoPIS=p.saldoPIS||0, saldoCOFINS=p.saldoCOFINS||0;
+  var totalSaldo=p.totalSaldo||0, compraMinima=p.compraMinima||0;
+  var txICMS=p.txICMS||0.18, txPIS=p.txPIS||0.0135, txCOFINS=p.txCOFINS||0.0623;
+  function corV(v){return v>=0?'#28a745':'#dc3545';}
+  function bgV(v){return v>=0?'#d4edda':'#f8d7da';}
+  function lbl(v){return v>=0?'✅ Crédito acumulado':'🔴 A recolher';}
+
+  if(simValor <= 0) {
+    resEl.innerHTML = '<div style="background:#f0f0f5;border-radius:8px;padding:20px;text-align:center;"><div style="font-size:24px;margin-bottom:4px;">🔮</div><div style="font-size:11px;color:#888;">Digite um valor acima para simular.</div></div>';
+    return;
+  }
+  var cI=simValor*txICMS, cP=simValor*txPIS, cC=simValor*txCOFINS, cT=cI+cP+cC;
+  var nI=saldoICMS+cI, nP=saldoPIS+cP, nC=saldoCOFINS+cC, nT=nI+nP+nC;
+  var rh='<table style="width:100%;font-size:11px;border-collapse:collapse;margin-bottom:8px;">';
+  rh+='<tr style="background:#f8f9fa;"><th style="padding:5px 8px;text-align:left;color:#888;font-weight:600;"></th><th style="padding:5px 8px;text-align:right;color:#888;font-weight:600;">Saldo Atual</th><th style="padding:5px 8px;text-align:center;color:#888;font-weight:600;">+ Crédito</th><th style="padding:5px 8px;text-align:right;color:#888;font-weight:600;">Novo Saldo</th></tr>';
+  function sR(im,co,sa,cr,ns){return '<tr style="border-bottom:1px solid #f0f0f0;"><td style="padding:4px 8px;font-weight:700;color:'+co+';">'+im+'</td><td style="padding:4px 8px;text-align:right;color:'+corV(sa)+';">'+formatCurrency(Math.abs(sa))+'</td><td style="padding:4px 8px;text-align:center;color:#28a745;font-weight:600;">+'+formatCurrency(cr)+'</td><td style="padding:4px 8px;text-align:right;font-weight:700;color:'+corV(ns)+';">'+formatCurrency(Math.abs(ns))+'</td></tr>';}
+  rh+=sR('ICMS','#1a5276',saldoICMS,cI,nI);
+  rh+=sR('PIS','#e67e22',saldoPIS,cP,nP);
+  rh+=sR('COFINS','#6f42c1',saldoCOFINS,cC,nC);
+  rh+='<tr style="border-top:2px solid #ccc;"><td style="padding:5px 8px;font-weight:800;">TOTAL</td><td style="padding:5px 8px;text-align:right;font-weight:700;color:'+corV(totalSaldo)+';">'+formatCurrency(Math.abs(totalSaldo))+'</td><td style="padding:5px 8px;text-align:center;color:#28a745;font-weight:800;">+'+formatCurrency(cT)+'</td><td style="padding:5px 8px;text-align:right;font-weight:800;font-size:14px;color:'+corV(nT)+';">'+formatCurrency(Math.abs(nT))+'</td></tr>';
+  rh+='</table>';
+  rh+='<div style="padding:8px 12px;border-radius:8px;background:'+bgV(nT)+';display:flex;justify-content:space-between;align-items:center;">';
+  rh+='<span style="font-size:12px;font-weight:700;color:'+corV(nT)+';">'+lbl(nT)+'</span>';
+  rh+='<span style="font-size:18px;font-weight:800;color:'+corV(nT)+';">'+formatCurrency(Math.abs(nT))+'</span>';
+  rh+='</div>';
+  if(totalSaldo<0&&compraMinima>0){var diff=simValor-compraMinima;if(diff>0)rh+='<div style="margin-top:6px;font-size:10px;color:#28a745;">▲ '+formatCurrency(diff)+' acima do mínimo — margem de segurança</div>';else if(diff<0)rh+='<div style="margin-top:6px;font-size:10px;color:#dc3545;">▼ '+formatCurrency(Math.abs(diff))+' abaixo do mínimo sugerido</div>';}
+  resEl.innerHTML = rh;
+}
+
+
+function salvarSaldosIniciaisCT() {
+  var obj = {
+    icms: document.getElementById('ct-saldo-ini-icms') ? document.getElementById('ct-saldo-ini-icms').value : '',
+    pis: document.getElementById('ct-saldo-ini-pis') ? document.getElementById('ct-saldo-ini-pis').value : '',
+    cofins: document.getElementById('ct-saldo-ini-cofins') ? document.getElementById('ct-saldo-ini-cofins').value : '',
+    vendas: document.getElementById('ct-vendas-proj') ? document.getElementById('ct-vendas-proj').value : ''
+  };
+  setConfigItem('ct_saldos_iniciais', JSON.stringify(obj));
+  showToast('💾 Saldos iniciais e vendas projetadas salvos!');
+}
 
 function criarCT(prefill) {
   var item = prefill || {};
@@ -2914,7 +3288,7 @@ function criarCT(prefill) {
   openModal((item._editIdx!==undefined?'Editar':'Novo')+' Lançamento Tributário', body, null, '750px');
 }
 
-function salvarCT(editIdx) {
+async function salvarCT(editIdx) {
   var imposto = document.getElementById('ct-f-imposto').value;
   var natureza = document.getElementById('ct-f-natureza').value;
   var competencia = document.getElementById('ct-f-competencia').value;
@@ -2927,12 +3301,243 @@ function salvarCT(editIdx) {
   var items = getData('creditos_trib');
   var rec = {imposto:imposto,natureza:natureza,competencia:competencia,valor:valor,nfRef:nfRef,fornecedor:fornecedor,descricao:descricao};
   if(editIdx>=0){ items[editIdx]=rec; } else { items.push(rec); }
-  setData('creditos_trib',items); closeModal(); pesquisarCT();
+  await setData('creditos_trib',items);
+  closeModal(); pesquisarCT(); calcularDebitosProjetados();
   showToast(editIdx>=0?'Lançamento atualizado!':'Lançamento registrado!');
 }
 
 function editarCT(idx) { var items=getData('creditos_trib'); var i=items[idx]; if(i){i._editIdx=idx;criarCT(i);} }
-function deletarCT(idx) { if(!confirm('Excluir este lançamento?'))return; var items=getData('creditos_trib'); items.splice(idx,1); setData('creditos_trib',items); pesquisarCT(); showToast('Lançamento excluído.'); }
+async function deletarCT(idx) {
+  if(!confirm('Excluir este lançamento?')) return;
+  var items=getData('creditos_trib');
+  items.splice(idx,1);
+  await setData('creditos_trib',items);
+  pesquisarCT();
+  calcularDebitosProjetados();
+  showToast('Lançamento excluído.');
+}
+
+function zerarCreditosTrib() {
+  var items = getData('creditos_trib');
+  if(items.length === 0) { showToast('Não há lançamentos para zerar.', true); return; }
+
+  // Primeira confirmação
+  var totalICMS=0, totalPIS=0, totalCOFINS=0;
+  items.forEach(function(i){
+    var v = parseCurrency(i.valor);
+    if(i.imposto==='ICMS') totalICMS += v;
+    if(i.imposto==='PIS') totalPIS += v;
+    if(i.imposto==='COFINS') totalCOFINS += v;
+  });
+
+  if(!confirm(
+    '⚠️ ATENÇÃO: Você vai APAGAR TODOS os '+items.length+' lançamentos de créditos tributários.\n\n'+
+    'Resumo do que será excluído:\n'+
+    '• ICMS: '+formatCurrency(totalICMS)+'\n'+
+    '• PIS: '+formatCurrency(totalPIS)+'\n'+
+    '• COFINS: '+formatCurrency(totalCOFINS)+'\n\n'+
+    'Deseja continuar?'
+  )) return;
+
+  // Segunda confirmação — pedir motivo
+  var motivo = prompt(
+    '🔴 SEGUNDA CONFIRMAÇÃO\n\n'+
+    'Digite o motivo da exclusão (obrigatório):\n'+
+    'Ex: "Dados incorretos", "Recarga do mês", "Migração de sistema"'
+  );
+
+  if(!motivo || motivo.trim().length < 3) {
+    showToast('❌ Operação cancelada. Motivo não informado.', true);
+    return;
+  }
+
+  // Logar a exclusão no console e no Firestore
+  var logEntry = {
+    acao: 'zerar_creditos_trib',
+    motivo: motivo.trim(),
+    qtdLancamentos: items.length,
+    totalICMS: totalICMS,
+    totalPIS: totalPIS,
+    totalCOFINS: totalCOFINS,
+    executadoPor: currentUser ? currentUser.email : 'desconhecido',
+    data: new Date().toISOString()
+  };
+  console.log('[AUDITORIA] Créditos tributários zerados:', logEntry);
+
+  // Salvar log de auditoria
+  var logs = getData('audit_log') || [];
+  logs.push(logEntry);
+  setData('audit_log', logs);
+
+  // Zerar
+  setData('creditos_trib', []).then(function(){
+    pesquisarCT();
+    calcularDebitosProjetados();
+    showToast('🗑️ '+items.length+' lançamento(s) excluído(s). Motivo: "'+motivo.trim()+'"');
+  });
+}
+
+function showImportXMLCreditos() {
+  var body='<div style="padding:20px;">'+
+    '<div id="ct-xml-zone" style="border:3px dashed #28a745;border-radius:12px;padding:36px;text-align:center;cursor:pointer;background:#f0fff4;transition:all .2s;" '+
+    'ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';this.style.background=\'#fff3e0\';" '+
+    'ondragleave="this.style.borderColor=\'#28a745\';this.style.background=\'#f0fff4\';" '+
+    'ondrop="event.preventDefault();this.style.borderColor=\'#28a745\';this.style.background=\'#f0fff4\';handleCTXmlFiles(event.dataTransfer.files);" '+
+    'onclick="document.getElementById(\'ct-xml-input\').click();">'+
+    '<div style="font-size:44px;margin-bottom:8px;">📄</div>'+
+    '<div style="font-size:15px;color:#28a745;font-weight:bold;">Clique ou arraste o XML da NF-e aqui</div>'+
+    '<div style="font-size:12px;color:#666;margin-top:6px;">O sistema vai extrair PIS, COFINS e ICMS automaticamente</div>'+
+    '<input type="file" id="ct-xml-input" accept=".xml" multiple style="display:none;" onchange="handleCTXmlFiles(this.files);">'+
+    '</div>'+
+    '<div id="ct-xml-preview" style="margin-top:15px;"></div>'+
+  '</div>';
+  openModal('📄 Importar XML → Gerar Créditos Tributários', body, null, '850px');
+}
+
+function handleCTXmlFiles(files) {
+  if(!files||files.length===0) return;
+  window._ctXmlResults = [];
+  var pending = files.length;
+
+  Array.from(files).forEach(function(file){
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        var nfe = parseNFeXML(e.target.result, file.name);
+        if(nfe) window._ctXmlResults.push(nfe);
+      } catch(err) { console.error('Erro XML:', err); }
+      pending--;
+      if(pending === 0) renderCTXmlPreview();
+    };
+    reader.readAsText(file, 'UTF-8');
+  });
+}
+
+function renderCTXmlPreview() {
+  var nfes = window._ctXmlResults || [];
+  if(nfes.length === 0) {
+    document.getElementById('ct-xml-preview').innerHTML='<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:12px;color:#721c24;font-size:13px;">❌ Nenhuma NF-e válida encontrada.</div>';
+    return;
+  }
+
+  var ctItems = getData('creditos_trib');
+  var html = '';
+  var totalCreditos = 0;
+  var totalNfes = 0;
+  var detalhes = [];
+
+  nfes.forEach(function(nfe, idx) {
+    var impostos = nfe.impostos || {};
+    var vPIS = parseFloat(impostos.vPIS) || 0;
+    var vCOFINS = parseFloat(impostos.vCOFINS) || 0;
+    var vICMS = parseFloat(impostos.vICMS) || 0;
+    var vBC = parseFloat(impostos.vBC) || 0;
+    var bcPIS = parseFloat(impostos.bcPIS) || 0;
+    var bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
+    var pPIS = parseFloat(impostos.pPIS) || 0;
+    var pCOFINS = parseFloat(impostos.pCOFINS) || 0;
+    var aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS/bcPIS*100) : 0);
+    var aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS/bcCOFINS*100) : 0);
+    var aliqICMS = vBC > 0 ? (vICMS/vBC*100) : 0;
+    var basePIS = bcPIS > 0 ? bcPIS : parseFloat(impostos.vProd) || 0;
+    var baseCOFINS = bcCOFINS > 0 ? bcCOFINS : parseFloat(impostos.vProd) || 0;
+
+    // Verificar duplicata
+    var nfeRef = String(nfe.numero||'');
+    var jaExiste = ctItems.some(function(ct){ return ct.nfRef===nfeRef && ct._chaveNFe===nfe.chave; });
+
+    var totalNFe = vICMS + vPIS + vCOFINS;
+    if(!jaExiste) { totalCreditos += totalNFe; totalNfes++; }
+
+    html += '<div style="background:white;border:1px solid '+(jaExiste?'#ffc107':'#28a745')+';border-radius:8px;padding:15px;margin-bottom:10px;">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
+    html += '<div><span style="background:#1a5276;color:white;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">NF-e '+(nfe.numero||'')+'</span> <span style="font-size:12px;color:#666;">'+formatDateBR(nfe.emissao)+' — '+(nfe.fornecedor||'')+'</span></div>';
+    if(jaExiste) {
+      html += '<span style="background:#fff3cd;color:#856404;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">⚠️ Já existe</span>';
+    } else {
+      html += '<span style="font-size:16px;font-weight:bold;color:#28a745;">'+formatCurrency(totalNFe)+'</span>';
+    }
+    html += '</div>';
+
+    if(!jaExiste) {
+      html += '<table style="width:100%;font-size:12px;border-collapse:collapse;"><thead><tr style="background:#f8f9fa;"><th style="padding:6px 10px;text-align:left;">Imposto</th><th style="text-align:right;padding:6px 10px;">Base Cálculo</th><th style="text-align:center;padding:6px 10px;">Alíquota</th><th style="text-align:right;padding:6px 10px;">Crédito</th></tr></thead><tbody>';
+      if(vICMS > 0) html += '<tr><td style="padding:5px 10px;"><span style="background:#1a5276;color:white;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;">ICMS</span></td><td style="text-align:right;padding:5px 10px;">'+formatCurrency(vBC)+'</td><td style="text-align:center;padding:5px 10px;font-weight:700;color:#1a5276;">'+aliqICMS.toFixed(2)+'%</td><td style="text-align:right;padding:5px 10px;font-weight:700;color:#28a745;">'+formatCurrency(vICMS)+'</td></tr>';
+      if(vPIS > 0) html += '<tr><td style="padding:5px 10px;"><span style="background:#e67e22;color:white;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;">PIS</span></td><td style="text-align:right;padding:5px 10px;">'+formatCurrency(basePIS)+'</td><td style="text-align:center;padding:5px 10px;font-weight:700;color:#e67e22;">'+aliqPIS.toFixed(2)+'%</td><td style="text-align:right;padding:5px 10px;font-weight:700;color:#28a745;">'+formatCurrency(vPIS)+'</td></tr>';
+      if(vCOFINS > 0) html += '<tr><td style="padding:5px 10px;"><span style="background:#6f42c1;color:white;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700;">COFINS</span></td><td style="text-align:right;padding:5px 10px;">'+formatCurrency(baseCOFINS)+'</td><td style="text-align:center;padding:5px 10px;font-weight:700;color:#6f42c1;">'+aliqCOFINS.toFixed(2)+'%</td><td style="text-align:right;padding:5px 10px;font-weight:700;color:#28a745;">'+formatCurrency(vCOFINS)+'</td></tr>';
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+  });
+
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px;padding:14px;background:#f0f0f0;border-radius:6px;">';
+  html += '<div style="font-size:14px;"><strong>'+totalNfes+' NF-e(s)</strong> — Total de créditos: <strong style="color:#28a745;">'+formatCurrency(totalCreditos)+'</strong></div>';
+  html += '<button onclick="confirmImportXMLCreditos()" style="background:#28a745;color:white;border:none;padding:12px 28px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;"'+(totalNfes===0?' disabled style="opacity:0.5"':'')+'>✅ GERAR '+totalNfes+' CRÉDITO(S)</button>';
+  html += '</div>';
+
+  document.getElementById('ct-xml-preview').innerHTML = html;
+}
+
+function confirmImportXMLCreditos() {
+  var nfes = window._ctXmlResults || [];
+  if(nfes.length === 0) return;
+
+  var ctItems = getData('creditos_trib');
+  var count = 0;
+
+  nfes.forEach(function(nfe) {
+    var impostos = nfe.impostos || {};
+    var vPIS = parseFloat(impostos.vPIS) || 0;
+    var vCOFINS = parseFloat(impostos.vCOFINS) || 0;
+    var vICMS = parseFloat(impostos.vICMS) || 0;
+    var vBC = parseFloat(impostos.vBC) || 0;
+    var bcPIS = parseFloat(impostos.bcPIS) || 0;
+    var bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
+    var pPIS = parseFloat(impostos.pPIS) || 0;
+    var pCOFINS = parseFloat(impostos.pCOFINS) || 0;
+
+    if(vPIS === 0 && vCOFINS === 0 && vICMS === 0) return;
+
+    var nfeRef = String(nfe.numero||'');
+    var chaveNfe = nfe.chave || '';
+    var jaExiste = ctItems.some(function(ct){ return ct.nfRef===nfeRef && ct._chaveNFe===chaveNfe; });
+    if(jaExiste) return;
+
+    var competencia = nfe.emissao || '';
+    var fornecedor = nfe.fornecedor || '';
+    var cfopsNFe = (nfe.produtos||[]).map(function(p){ return String(p.cfop||''); });
+    var cfopsStr = cfopsNFe.filter(function(v,i,a){ return a.indexOf(v)===i; }).join(', ');
+
+    var aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS/bcPIS*100) : 0);
+    var aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS/bcCOFINS*100) : 0);
+    var aliqICMS = vBC > 0 ? (vICMS/vBC*100) : 0;
+    var basePIS = bcPIS > 0 ? bcPIS : parseFloat(impostos.vProd) || 0;
+    var baseCOFINS = bcCOFINS > 0 ? bcCOFINS : parseFloat(impostos.vProd) || 0;
+
+    if(vICMS > 0) {
+      ctItems.push({ imposto:'ICMS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vICMS), baseCalculo:formatCurrency(vBC), aliquota:aliqICMS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'ICMS próprio s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      count++;
+    }
+    if(vPIS > 0) {
+      ctItems.push({ imposto:'PIS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vPIS), baseCalculo:formatCurrency(basePIS), aliquota:aliqPIS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'PIS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      count++;
+    }
+    if(vCOFINS > 0) {
+      ctItems.push({ imposto:'COFINS', natureza:'Crédito', competencia:competencia, valor:formatCurrency(vCOFINS), baseCalculo:formatCurrency(baseCOFINS), aliquota:aliqCOFINS.toFixed(2)+'%', nfRef:nfeRef, fornecedor:fornecedor, descricao:'COFINS s/ compra NF-e '+nfeRef+' (CFOP '+cfopsStr+')', _chaveNFe:chaveNfe, _geradoAuto:true });
+      count++;
+    }
+  });
+
+  if(count > 0) {
+    setData('creditos_trib', ctItems);
+    closeModal();
+    pesquisarCT();
+    calcularDebitosProjetados();
+    showToast('✅ '+count+' crédito(s) tributário(s) gerado(s) com sucesso!');
+  } else {
+    showToast('Nenhum crédito novo para gerar (todos já existem).', true);
+  }
+  window._ctXmlResults = null;
+}
 
 function exportarCT() {
   var items = window._ctFilteredItems || getData('creditos_trib');
@@ -4233,7 +4838,14 @@ function renderEstoque() {
   var totalSkus = skus.length;
   var totalPecas = posicao.reduce(function(s,p){ return s+p.qtd_atual; },0);
   var custoTotal = posicao.reduce(function(s,p){ return s+p.custo_total; },0);
-  var abaixoMinimo = posicao.filter(function(p){ return p.sku.estoque_minimo>0&&p.qtd_atual<=p.sku.estoque_minimo; }).length;
+  var totalACaminho = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_a_caminho)||0); },0);
+  var totalVendas30d = skus.reduce(function(s,sk){ return s + (parseInt(sk.vendas_30d)||0); },0);
+  var abaixoMinimo = posicao.filter(function(p){
+    var v30 = parseInt(p.sku.vendas_30d)||0;
+    var vel = v30/30;
+    var dias = vel > 0 ? p.qtd_atual / vel : 999;
+    return (p.qtd_atual <= 0 && v30 > 0) || (dias <= 21 && v30 > 10);
+  }).length;
 
   content.innerHTML =
     '<div class="filter-panel">'+
@@ -4242,8 +4854,10 @@ function renderEstoque() {
         '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+
           '<button onclick="showSection(\'estoque-movimentacoes\')" style="background:#1a5276;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔄 Movimentações</button>'+
           '<button onclick="abrirFormSku()" style="background:#27ae60;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">➕ Novo SKU</button>'+
-          '<button onclick="abrirImportEstoque()" style="background:#8e44ad;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📥 Importar</button>'+
+          '<button onclick="abrirImportEstoque()" style="background:#FFE600;color:#1a5276;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700;">📥 Importar</button>'+
+          '<button onclick="sincronizarEstoqueML()" style="background:#2D3277;color:#FFE600;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700;" id="btn-sync-ml">🔗 Sincronizar ML</button>'+
           '<button onclick="exportarEstoque()" style="background:#888;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;">📤 Exportar</button>'+
+          '<button onclick="limparEstoqueTotal()" style="background:#dc3545;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700;">🗑️ Limpar Tudo</button>'+
         '</div>'+
       '</div>'+
       '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">'+
@@ -4252,18 +4866,21 @@ function renderEstoque() {
         '<div><label style="font-size:11px;color:#666;">Status</label>'+
         '<select id="est-status" onchange="filtrarEstoque()" style="padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;display:block;margin-top:3px;">'+
           '<option value="todos">Todos</option><option value="ok">✅ Normal</option>'+
-          '<option value="minimo">⚠️ Abaixo do mínimo</option><option value="zerado">🔴 Zerado</option>'+
+          '<option value="urgente">🔴 Urgente (&lt;7d)</option><option value="atencao">⚠️ Atenção (&lt;21d)</option>'+
+          '<option value="zerado">❌ Sem estoque</option><option value="excesso">📦 Excesso (&gt;60d)</option>'+
         '</select></div>'+
       '</div>'+
     '</div>'+
-    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px;">'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:16px;">'+
       '<div class="dash-card blue"><div class="label">📦 SKUs</div><div class="value" style="font-size:26px;">'+totalSkus+'</div></div>'+
-      '<div class="dash-card green"><div class="label">🔢 Total Peças</div><div class="value" style="font-size:22px;">'+totalPecas.toLocaleString('pt-BR')+'</div></div>'+
-      '<div class="dash-card orange"><div class="label">💰 Custo Total</div><div class="value" style="font-size:20px;">'+formatCurrency(custoTotal)+'</div></div>'+
+      '<div class="dash-card green"><div class="label">✅ Full (aptas)</div><div class="value" style="font-size:20px;">'+totalPecas.toLocaleString('pt-BR')+'</div></div>'+
+      '<div class="dash-card orange"><div class="label">💰 Custo Total</div><div class="value" style="font-size:18px;">'+formatCurrency(custoTotal)+'</div></div>'+
       '<div class="dash-card" style="border-left:4px solid '+(abaixoMinimo>0?'#e74c3c':'#27ae60')+';">'+
-        '<div class="label">'+(abaixoMinimo>0?'⚠️':'✅')+' Abaixo Mínimo</div>'+
+        '<div class="label">🚨 Alertas</div>'+
         '<div class="value" style="font-size:26px;color:'+(abaixoMinimo>0?'#e74c3c':'#27ae60')+';">'+abaixoMinimo+'</div>'+
       '</div>'+
+      '<div class="dash-card" style="border-left:4px solid #f39c12;"><div class="label">🚚 A caminho</div><div class="value" style="font-size:20px;color:#f39c12;">'+totalACaminho.toLocaleString('pt-BR')+'</div></div>'+
+      '<div class="dash-card" style="border-left:4px solid #0d6efd;"><div class="label">📈 Vendas 30d</div><div class="value" style="font-size:20px;color:#0d6efd;">'+totalVendas30d.toLocaleString('pt-BR')+'</div></div>'+
     '</div>'+
     '<div id="est-tabela-wrap"></div>';
 
@@ -4276,71 +4893,96 @@ function _renderTabelaEstoque(posicao) {
   var filtered = posicao.filter(function(p) {
     var match = !busca || p.sku.sku.toLowerCase().includes(busca) || p.sku.descricao.toLowerCase().includes(busca);
     if(!match) return false;
-    if(status==='ok')     return p.qtd_atual > (p.sku.estoque_minimo||0);
-    if(status==='minimo') return p.sku.estoque_minimo>0 && p.qtd_atual<=p.sku.estoque_minimo && p.qtd_atual>0;
-    if(status==='zerado') return p.qtd_atual <= 0;
+    var v30 = parseInt(p.sku.vendas_30d)||0;
+    var vel = v30/30;
+    var dias = vel > 0 ? p.qtd_atual / vel : 999;
+    if(status==='ok')      return dias > 21;
+    if(status==='urgente') return dias <= 7 && v30 > 0;
+    if(status==='atencao') return dias > 7 && dias <= 21 && v30 > 0;
+    if(status==='zerado')  return p.qtd_atual <= 0;
+    if(status==='excesso') return dias > 60;
     return true;
+  });
+
+  filtered.sort(function(a,b){
+    var va = parseInt(a.sku.vendas_30d)||0; var vb = parseInt(b.sku.vendas_30d)||0;
+    var da = va > 0 ? a.qtd_atual / (va/30) : 999;
+    var db = vb > 0 ? b.qtd_atual / (vb/30) : 999;
+    return da - db;
   });
 
   if(filtered.length === 0) {
     document.getElementById('est-tabela-wrap').innerHTML =
       '<div style="padding:30px;text-align:center;color:#888;background:#fff;border-radius:10px;border:1px solid #eee;">'+
       (getSkus().length===0
-        ? '📦 Nenhum SKU cadastrado. <button onclick="abrirFormSku()" style="background:#27ae60;color:white;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-left:8px;">➕ Cadastrar primeiro SKU</button>'
+        ? '📦 Nenhum SKU cadastrado. <button onclick="abrirImportEstoque()" style="background:#FFE600;color:#1a5276;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-left:8px;">📥 Importar ML Full</button>'
         : 'Nenhum SKU encontrado.'
       )+'</div>';
     return;
   }
 
+  var totalF = 0;
   var rows = filtered.map(function(p) {
     var sku = p.sku;
-    var estMin = parseFloat(sku.estoque_minimo)||0;
-    var alerta = p.qtd_atual<=0?'red':(estMin>0&&p.qtd_atual<=estMin?'orange':'green');
-    var icon   = p.qtd_atual<=0?'🔴':(alerta==='orange'?'⚠️':'✅');
-    var qtdC   = p.qtd_atual<=0?'#e74c3c':(alerta==='orange'?'#f39c12':'#27ae60');
+    var v30 = parseInt(sku.vendas_30d)||0;
+    var vel = v30 > 0 ? (v30/30) : 0;
+    var dias = vel > 0 ? Math.round(p.qtd_atual / vel) : (p.qtd_atual > 0 ? 999 : 0);
+    var aCaminho = parseInt(sku.full_a_caminho)||0;
+    totalF += p.custo_total;
+
+    var alertBadge = '';
+    if(p.qtd_atual <= 0 && v30 > 0) alertBadge = '<span style="background:#dc3545;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">SEM ESTOQUE</span>';
+    else if(dias <= 7 && v30 > 0) alertBadge = '<span style="background:#dc3545;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">🔴 '+dias+'d</span>';
+    else if(dias <= 21 && v30 > 0) alertBadge = '<span style="background:#f39c12;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">⚠️ '+dias+'d</span>';
+    else if(dias <= 45) alertBadge = '<span style="background:#27ae60;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">✅ '+dias+'d</span>';
+    else if(dias < 999) alertBadge = '<span style="background:#17a2b8;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">📦 '+dias+'d</span>';
+    else alertBadge = '<span style="color:#ccc;font-size:10px;">—</span>';
+
+    var velStr = vel > 0 ? vel.toFixed(1)+'/dia' : '—';
+    var qtdC = p.qtd_atual<=0?'#e74c3c':(dias<=7?'#e74c3c':(dias<=21?'#f39c12':'#27ae60'));
+
     return '<tr style="border-bottom:1px solid #f0f0f0;">'+
-      '<td style="padding:8px 12px;font-weight:700;font-size:12px;color:#1a5276;">'+icon+' '+sku.sku+'</td>'+
-      '<td style="padding:8px 12px;font-size:12px;">'+sku.descricao+'</td>'+
-      '<td style="padding:8px 12px;text-align:center;font-weight:700;font-size:15px;color:'+qtdC+';">'+p.qtd_atual.toLocaleString('pt-BR')+'<span style="font-size:10px;font-weight:400;color:#aaa;"> '+(sku.unidade||'un')+'</span></td>'+
-      '<td style="padding:8px 12px;text-align:center;font-size:12px;color:#888;">'+(estMin>0?estMin.toLocaleString('pt-BR'):'—')+'</td>'+
-      '<td style="padding:8px 12px;text-align:right;font-size:12px;">'+formatCurrency(p.custo_medio)+'</td>'+
-      '<td style="padding:8px 12px;text-align:right;font-weight:700;font-size:12px;color:#1a5276;">'+formatCurrency(p.custo_total)+'</td>'+
-      '<td style="padding:8px 12px;text-align:center;font-size:11px;color:#888;">'+(p.ultima_mov?formatDateBR(p.ultima_mov):'—')+'</td>'+
-      '<td style="padding:8px 12px;text-align:center;font-size:11px;color:#888;">'+p.qtd_movs+'</td>'+
-      '<td style="padding:8px 12px;white-space:nowrap;">'+
-        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'entrada\')" style="background:#27ae60;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;">▲</button> '+
-        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'saida\')" style="background:#e74c3c;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;">▼</button> '+
-        '<button onclick="verHistoricoSku(\''+sku.id+'\')" style="background:#1a5276;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;">📋</button> '+
-        '<button onclick="editarSku(\''+sku.id+'\')" style="background:#f39c12;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;">✏️</button> '+
-        '<button onclick="excluirSku(\''+sku.id+'\')" style="background:#e0e0e0;color:#555;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;">🗑️</button>'+
+      '<td style="padding:7px 10px;font-weight:700;font-size:12px;color:#1a5276;">'+sku.sku+'</td>'+
+      '<td style="padding:7px 10px;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+sku.descricao+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-weight:700;font-size:15px;color:'+qtdC+';">'+p.qtd_atual.toLocaleString('pt-BR')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-size:12px;color:#f39c12;font-weight:'+(aCaminho>0?'700':'400')+';">'+(aCaminho>0?'+'+aCaminho:'—')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-size:11px;color:#0d6efd;">'+velStr+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;">'+alertBadge+'</td>'+
+      '<td style="padding:7px 10px;text-align:right;font-size:11px;">'+formatCurrency(p.custo_medio)+'</td>'+
+      '<td style="padding:7px 10px;text-align:right;font-weight:700;font-size:11px;color:#1a5276;">'+formatCurrency(p.custo_total)+'</td>'+
+      '<td style="padding:7px 10px;white-space:nowrap;">'+
+        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'entrada\')" style="background:#27ae60;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Entrada">▲</button> '+
+        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'saida\')" style="background:#e74c3c;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Saída">▼</button> '+
+        '<button onclick="editarSku(\''+sku.id+'\')" style="background:#f39c12;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Editar">✏️</button> '+
+        '<button onclick="excluirSku(\''+sku.id+'\')" style="background:#e0e0e0;color:#555;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Excluir">🗑️</button>'+
       '</td>'+
     '</tr>';
   }).join('');
 
-  var totalF = filtered.reduce(function(s,p){ return s+p.custo_total; },0);
   document.getElementById('est-tabela-wrap').innerHTML =
     '<div style="background:#fff;border:1px solid #e0e0e0;border-radius:10px;overflow:hidden;">'+
       '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">'+
         '<thead><tr style="background:#1a5276;color:#fff;">'+
-          '<th style="padding:9px 12px;text-align:left;font-size:11px;">SKU</th>'+
-          '<th style="padding:9px 12px;text-align:left;font-size:11px;">Descrição</th>'+
-          '<th style="padding:9px 12px;text-align:center;font-size:11px;">Qtd. Atual</th>'+
-          '<th style="padding:9px 12px;text-align:center;font-size:11px;">Est. Mín.</th>'+
-          '<th style="padding:9px 12px;text-align:right;font-size:11px;">Custo Médio</th>'+
-          '<th style="padding:9px 12px;text-align:right;font-size:11px;">Custo Total</th>'+
-          '<th style="padding:9px 12px;text-align:center;font-size:11px;">Última Mov.</th>'+
-          '<th style="padding:9px 12px;text-align:center;font-size:11px;">Movs.</th>'+
-          '<th style="padding:9px 12px;text-align:center;font-size:11px;">Ações</th>'+
+          '<th style="padding:9px 10px;text-align:left;font-size:11px;">SKU</th>'+
+          '<th style="padding:9px 10px;text-align:left;font-size:11px;">Descrição</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Full</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">A caminho</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Velocidade</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Esgotar em</th>'+
+          '<th style="padding:9px 10px;text-align:right;font-size:11px;">Custo Méd.</th>'+
+          '<th style="padding:9px 10px;text-align:right;font-size:11px;">Custo Total</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">A\u{00E7}ões</th>'+
         '</tr></thead>'+
         '<tbody>'+rows+'</tbody>'+
         '<tfoot><tr style="background:#f0f4f8;font-weight:700;">'+
-          '<td colspan="5" style="padding:8px 12px;text-align:right;font-size:12px;">Total Filtrado:</td>'+
-          '<td style="padding:8px 12px;text-align:right;font-size:13px;color:#1a5276;">'+formatCurrency(totalF)+'</td>'+
-          '<td colspan="3"></td>'+
+          '<td colspan="7" style="padding:8px 10px;text-align:right;font-size:12px;">Total Filtrado:</td>'+
+          '<td style="padding:8px 10px;text-align:right;font-size:13px;color:#1a5276;">'+formatCurrency(totalF)+'</td>'+
+          '<td></td>'+
         '</tr></tfoot>'+
       '</table></div>'+
     '</div>';
 }
+
 
 function filtrarEstoque() {
   _renderTabelaEstoque(calcularPosicao(getSkus(), getMov()));
@@ -4609,6 +5251,181 @@ function excluirMovimentacaoLista(movId){
   filtrarMovimentacoes();showToast('🗑️ Movimentação excluída.');
 }
 
+function limparEstoqueTotal() {
+  var skus = getSkus();
+  var movs = getMov();
+  if(skus.length === 0 && movs.length === 0) { showToast('Estoque já está vazio.', true); return; }
+
+  if(!confirm(
+    '⚠️ ATENÇÃO: Você vai APAGAR TODO o estoque.\n\n'+
+    '• '+skus.length+' SKU(s) cadastrado(s)\n'+
+    '• '+movs.length+' movimentação(ões)\n\n'+
+    'Essa ação é irreversível. Deseja continuar?'
+  )) return;
+
+  var motivo = prompt(
+    '🔴 SEGUNDA CONFIRMAÇÃO\n\n'+
+    'Digite o motivo da limpeza (obrigatório):\n'+
+    'Ex: "Nova carga ML Full", "Recadastramento", "Dados incorretos"'
+  );
+
+  if(!motivo || motivo.trim().length < 3) {
+    showToast('❌ Operação cancelada. Motivo não informado.', true);
+    return;
+  }
+
+  var logEntry = {
+    acao: 'limpar_estoque_total',
+    motivo: motivo.trim(),
+    qtdSkus: skus.length,
+    qtdMovs: movs.length,
+    executadoPor: currentUser ? currentUser.email : 'desconhecido',
+    data: new Date().toISOString()
+  };
+  console.log('[AUDITORIA] Estoque limpo:', logEntry);
+  var logs = getData('audit_log') || [];
+  logs.push(logEntry);
+  setData('audit_log', logs);
+
+  setSkus([]);
+  setMovs([]);
+  renderEstoque();
+  showToast('🗑️ Estoque limpo! '+skus.length+' SKU(s) e '+movs.length+' movimentação(ões) removidos. Motivo: "'+motivo.trim()+'"');
+}
+
+// ── MERCADO LIVRE — INTEGRAÇÃO ──
+function conectarML() {
+  showToast('⏳ Obtendo URL de autorização...');
+  var fn = firebase.functions().httpsCallable('mlGetAuthUrl');
+  fn({}).then(function(result) {
+    if(result.data && result.data.url) {
+      window.open(result.data.url, '_blank');
+      showToast('🔗 Janela de autorização aberta. Faça login no ML e autorize.');
+    }
+  }).catch(function(err) {
+    showToast('❌ Erro: '+err.message, true);
+  });
+}
+
+function verificarStatusML() {
+  var fn = firebase.functions().httpsCallable('mlStatus');
+  fn({}).then(function(result) {
+    var d = result.data;
+    if(!d.connected) {
+      showToast('ML não conectado. Clique em 🔗 Sincronizar ML para conectar.', true);
+      return;
+    }
+    var msg = '✅ ML Conectado — '+d.user_name+' (ID: '+d.user_id+')';
+    if(d.ultima_sincronizacao) msg += ' | Última sync: '+formatDateBR(d.ultima_sincronizacao.substring(0,10));
+    showToast(msg);
+  }).catch(function(err) { console.log('ML status:', err.message); });
+}
+
+function sincronizarEstoqueML() {
+  // Primeiro verificar se está conectado
+  var fnStatus = firebase.functions().httpsCallable('mlStatus');
+  fnStatus({}).then(function(result) {
+    var d = result.data;
+    if(!d.connected) {
+      // Não conectado — perguntar se quer conectar
+      if(confirm('Mercado Livre não está conectado.\n\nDeseja conectar agora? Você será redirecionado para autorizar o acesso.')) {
+        conectarML();
+      }
+      return;
+    }
+
+    // Conectado — confirmar sync
+    showToast('⏳ Sincronizando estoque com ML... Pode levar até 1 minuto.');
+    var btn = document.getElementById('btn-sync-ml');
+    if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
+
+    var fnSync = firebase.functions().httpsCallable('mlSincronizarEstoque');
+    fnSync({}).then(function(result) {
+      if(btn) { btn.disabled = false; btn.textContent = '🔗 Sincronizar ML'; }
+
+      var r = result.data;
+      if(!r.success) {
+        showToast('❌ Erro: '+r.error, true);
+        return;
+      }
+
+      // Importar produtos no estoque local
+      var skus = getSkus();
+      var movs = getMov();
+      var novos = 0, atualizados = 0;
+      var hoje = getToday();
+
+      r.produtos.forEach(function(p) {
+        if(!p.sku) return; // SKU vazio, ignorar
+
+        var idx = skus.findIndex(function(s){ return s.sku === p.sku; });
+
+        if(idx >= 0) {
+          // Atualizar
+          skus[idx].ml_item_id = p.item_id;
+          skus[idx].ml_inventory_id = p.inventory_id;
+          skus[idx].full_aptas = p.full_aptas;
+          skus[idx].full_a_caminho = 0;
+          skus[idx].preco_ml = p.preco;
+          skus[idx].ml_atualizado_em = hoje;
+          // Ajustar posição
+          movs.push({
+            id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
+            data: hoje, qtd: p.full_aptas,
+            custo_unitario: skus[idx].custo_medio || 'R$ 0,00',
+            nfe: '', historico: 'Sync ML API: '+p.full_aptas+' aptas ('+p.titulo.substring(0,40)+')',
+            _fonte: 'ml_api'
+          });
+          atualizados++;
+        } else {
+          // Criar novo SKU
+          var novoId = gerarIdEstoque();
+          skus.push({
+            id: novoId, sku: p.sku, descricao: p.titulo,
+            unidade: 'un', custo_medio: 'R$ 0,00', estoque_minimo: 0,
+            fornecedor: '', localizacao: 'ML Full', observacao: '',
+            ml_item_id: p.item_id, ml_inventory_id: p.inventory_id,
+            full_aptas: p.full_aptas, full_a_caminho: 0,
+            preco_ml: p.preco, ml_atualizado_em: hoje, criado_em: hoje
+          });
+          if(p.full_aptas > 0) {
+            movs.push({
+              id: gerarIdMov(), sku_id: novoId, tipo: 'ajuste',
+              data: hoje, qtd: p.full_aptas, custo_unitario: 'R$ 0,00',
+              nfe: '', historico: 'Carga ML API: '+p.full_aptas+' aptas ('+p.titulo.substring(0,40)+')',
+              _fonte: 'ml_api'
+            });
+          }
+          novos++;
+        }
+      });
+
+      setSkus(skus);
+      setMovs(movs);
+      renderEstoque();
+      showToast('✅ ML sincronizado em '+r.duracao+'s! '+novos+' novo(s) · '+atualizados+' atualizado(s) · '+r.total_ativos+' SKUs ativos');
+
+    }).catch(function(err) {
+      if(btn) { btn.disabled = false; btn.textContent = '🔗 Sincronizar ML'; }
+      showToast('❌ Erro na sincronização: '+err.message, true);
+    });
+  }).catch(function(err) {
+    showToast('❌ Erro: '+err.message, true);
+  });
+}
+
+// Detectar callback ML na URL (após autorização)
+(function checkMLCallback() {
+  var params = new URLSearchParams(window.location.search);
+  if(params.get('ml_connected') === 'true') {
+    // Limpar URL
+    window.history.replaceState({}, document.title, window.location.pathname);
+    setTimeout(function() {
+      showToast('✅ Mercado Livre conectado com sucesso! Agora você pode sincronizar o estoque.');
+    }, 1500);
+  }
+})();
+
 function exportarEstoque(){
   var pos=calcularPosicao(getSkus(),getMov());
   var headers=['SKU','Descrição','Unidade','Qtd. Atual','Est. Mínimo','Custo Médio','Custo Total','Última Mov.','Movs.'];
@@ -4626,7 +5443,15 @@ function abrirImportEstoque() {
   var body =
     '<div style="padding:16px;">'+
     '<p style="font-size:12px;color:#666;margin-bottom:14px;">Escolha a origem dos dados a importar:</p>'+
-    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">'+
+
+      // ML Full Excel (NOVO - destaque)
+      '<label style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px;border:2px solid #FFE600;border-radius:10px;cursor:pointer;background:#FFFDE7;transition:all .2s;box-shadow:0 2px 8px rgba(255,230,0,0.3);" onmouseover="this.style.background=\'#FFF9C4\'" onmouseout="this.style.background=\'#FFFDE7\'">'+
+        '<span style="font-size:32px;">🛍️</span>'+
+        '<span style="font-weight:700;font-size:13px;color:#1a5276;">Mercado Livre Full</span>'+
+        '<span style="font-size:11px;color:#888;text-align:center;">Relatório de estoque<br>exportado do ML Full</span>'+
+        '<input type="file" accept=".xlsx,.xls" style="display:none;" onchange="handleImportMLFull(this.files[0])">'+
+      '</label>'+
 
       // NF-e XML
       '<label style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px;border:2px dashed #1a5276;border-radius:10px;cursor:pointer;background:#f0f7ff;transition:all .2s;" onmouseover="this.style.background=\'#dbeafe\'" onmouseout="this.style.background=\'#f0f7ff\'">'+
@@ -4644,28 +5469,234 @@ function abrirImportEstoque() {
         '<input type="file" accept=".xlsx,.xls,.csv,.txt" style="display:none;" onchange="handleImportPlanilhaEstoque(this.files[0],\'entrada\')">'+
       '</label>'+
 
-      // MercadoTurbo CSV
-      '<label style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px;border:2px dashed #e74c3c;border-radius:10px;cursor:pointer;background:#fff5f5;transition:all .2s;" onmouseover="this.style.background=\'#fee2e2\'" onmouseout="this.style.background=\'#fff5f5\'">'+
-        '<span style="font-size:32px;">🛒</span>'+
-        '<span style="font-weight:700;font-size:13px;color:#e74c3c;">MercadoTurbo CSV</span>'+
-        '<span style="font-size:11px;color:#888;text-align:center;">Relatório de vendas<br>(saídas automáticas)</span>'+
-        '<input type="file" accept=".csv,.txt,.xlsx,.xls" style="display:none;" onchange="handleImportMTEstoque(this.files[0])">'+
-      '</label>'+
-
-      // Excel/CSV Saída
-      '<label style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px;border:2px dashed #f39c12;border-radius:10px;cursor:pointer;background:#fffbeb;transition:all .2s;" onmouseover="this.style.background=\'#fef3c7\'" onmouseout="this.style.background=\'#fffbeb\'">'+
-        '<span style="font-size:32px;">📋</span>'+
-        '<span style="font-weight:700;font-size:13px;color:#f39c12;">Excel / CSV — Saída</span>'+
-        '<span style="font-size:11px;color:#888;text-align:center;">Planilha de vendas/saídas<br>SKU · Qtd · Data</span>'+
-        '<input type="file" accept=".xlsx,.xls,.csv,.txt" style="display:none;" onchange="handleImportPlanilhaEstoque(this.files[0],\'saida\')">'+
-      '</label>'+
-
     '</div>'+
     '<div style="margin-top:12px;text-align:center;">'+
       '<button onclick="baixarModeloEstoqueCSV()" style="background:none;border:1px solid #ccc;color:#666;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;">📥 Baixar modelo CSV</button>'+
     '</div>'+
     '</div>';
-  openModal('📥 Importar Movimentações de Estoque', body, null, '680px');
+  openModal('📥 Importar Estoque', body, null, '780px');
+}
+
+// ---- ML Full Excel → Carga de Estoque ----
+function handleImportMLFull(file) {
+  if(!file) return;
+  closeModal();
+  showToast('⏳ Lendo planilha do ML Full...');
+
+  loadSheetJS(function(){
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        var wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+        var ws = wb.Sheets['Resumo'] || wb.Sheets[wb.SheetNames[0]];
+        if(!ws) { showToast('❌ Aba "Resumo" não encontrada.', true); return; }
+
+        var range = XLSX.utils.decode_range(ws['!ref']);
+        function cell(r,c) { var a = XLSX.utils.encode_cell({r:r,c:c}); return ws[a] ? ws[a].v : null; }
+
+        // Detectar início dos dados: procurar "Código ML" na col B
+        var dataStart = -1;
+        for(var r=0; r<=Math.min(range.e.r, 20); r++) {
+          if(cell(r,1) === 'Código ML') { dataStart = r + 3; break; }
+        }
+        if(dataStart < 0) dataStart = 12;
+
+        var produtos = [];
+        var ignorados = 0;
+        for(var r=dataStart; r<=range.e.r; r++) {
+          // Col D (index 3) = SKU — chave principal
+          var sku = String(cell(r,3) || '').trim();
+          if(!sku) continue;
+
+          // Col G (index 6) = Produto/Descrição
+          var produto = cell(r,6) || '';
+          // Col L (index 11) = Vendas últimos 30 dias
+          var vendas30d = parseInt(cell(r,11)) || 0;
+          // Col N (index 13) = Entrada pendente
+          var entradaPend = parseInt(cell(r,13)) || 0;
+          // Col O (index 14) = Em transferência
+          var emTransf = parseInt(cell(r,14)) || 0;
+          // Col P (index 15) = Devolvidas pelo comprador
+          var devolvidas = parseInt(cell(r,15)) || 0;
+          // Col Q (index 16) = Aptas para venda
+          var aptasVenda = parseInt(cell(r,16)) || 0;
+
+          // FILTRO: soma(N+O+P+Q) = 0 → SKU obsoleto, ignora
+          var estoqueTotal = entradaPend + emTransf + devolvidas + aptasVenda;
+          if(estoqueTotal <= 0) { ignorados++; continue; }
+
+          // Dados complementares
+          var codML = cell(r,1) || '';
+          var ean = cell(r,2) || '';
+          var tempoEsgotar = cell(r,27) || '';
+
+          var aCaminho = entradaPend + emTransf + devolvidas;
+          var velocidadeDia = vendas30d > 0 ? (vendas30d / 30) : 0;
+          var diasParaEsgotar = velocidadeDia > 0 ? Math.round(aptasVenda / velocidadeDia) : (aptasVenda > 0 ? 999 : 0);
+
+          produtos.push({
+            sku: sku, cod_ml: codML, ean: String(ean), produto: produto,
+            vendas_30d: vendas30d, full_aptas: aptasVenda,
+            full_entrada_pend: entradaPend, full_em_transf: emTransf, full_devolvidas: devolvidas,
+            full_a_caminho: aCaminho, estoque_total: estoqueTotal,
+            tempo_esgotar: String(tempoEsgotar),
+            velocidade_dia: velocidadeDia, dias_esgotar: diasParaEsgotar
+          });
+        }
+
+        if(produtos.length === 0) { showToast('❌ Nenhum produto ativo encontrado na planilha.', true); return; }
+        window._mlFullImportData = produtos;
+        window._mlFullIgnorados = ignorados;
+        renderMLFullPreview(produtos, ignorados);
+      } catch(err) {
+        console.error('Erro ML Full:', err);
+        showToast('❌ Erro ao ler planilha: '+err.message, true);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function renderMLFullPreview(produtos, ignorados) {
+  var skus = getSkus();
+  var totalAptas = 0, totalCaminho = 0, totalVendas = 0, totalEstoque = 0;
+  var novos = 0, atualizados = 0;
+
+  var rows = produtos.map(function(p) {
+    totalAptas += p.full_aptas;
+    totalCaminho += p.full_a_caminho;
+    totalVendas += p.vendas_30d;
+    totalEstoque += p.estoque_total;
+
+    var existe = skus.find(function(s){ return s.sku === p.sku; });
+    if(existe) atualizados++; else novos++;
+
+    // Alerta baseado em dias para esgotar
+    var alerta = '';
+    if(p.full_aptas === 0) alerta = '<span style="background:#dc3545;color:white;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;">SEM APTAS</span>';
+    else if(p.dias_esgotar <= 7 && p.vendas_30d > 0) alerta = '<span style="background:#dc3545;color:white;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;">🔴 '+p.dias_esgotar+'d</span>';
+    else if(p.dias_esgotar <= 21 && p.vendas_30d > 0) alerta = '<span style="background:#f39c12;color:white;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;">⚠️ '+p.dias_esgotar+'d</span>';
+    else alerta = '<span style="background:#27ae60;color:white;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;">✅ OK</span>';
+
+    var badge = existe ? '<span style="background:#17a2b8;color:white;padding:1px 5px;border-radius:3px;font-size:9px;">ATUALIZAR</span>' : '<span style="background:#27ae60;color:white;padding:1px 5px;border-radius:3px;font-size:9px;">NOVO</span>';
+
+    return '<tr style="border-bottom:1px solid #f0f0f0;">'+
+      '<td style="padding:5px 8px;font-size:11px;font-weight:700;color:#1a5276;">'+p.sku+'</td>'+
+      '<td style="padding:5px 8px;font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+p.produto+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;font-weight:700;color:#27ae60;">'+p.full_aptas+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;color:#f39c12;font-weight:600;">'+(p.full_entrada_pend>0?p.full_entrada_pend:'—')+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;color:#888;">'+(p.full_em_transf>0?p.full_em_transf:'—')+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;color:#888;">'+(p.full_devolvidas>0?p.full_devolvidas:'—')+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;font-weight:800;color:#1a5276;">'+p.estoque_total+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;">'+p.vendas_30d+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;">'+alerta+'</td>'+
+      '<td style="padding:5px 8px;text-align:center;">'+badge+'</td>'+
+    '</tr>';
+  }).join('');
+
+  var body = '<div style="padding:16px;">'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:10px;margin-bottom:14px;">'+
+      '<div style="background:#f0f4f8;border-radius:8px;padding:10px;text-align:center;"><div style="font-size:10px;color:#888;">SKUs ativos</div><div style="font-size:22px;font-weight:800;color:#1a5276;">'+produtos.length+'</div></div>'+
+      '<div style="background:#d4edda;border-radius:8px;padding:10px;text-align:center;"><div style="font-size:10px;color:#888;">Aptas (Q)</div><div style="font-size:22px;font-weight:800;color:#27ae60;">'+totalAptas.toLocaleString('pt-BR')+'</div></div>'+
+      '<div style="background:#fff3cd;border-radius:8px;padding:10px;text-align:center;"><div style="font-size:10px;color:#888;">A caminho (N+O+P)</div><div style="font-size:22px;font-weight:800;color:#f39c12;">'+totalCaminho.toLocaleString('pt-BR')+'</div></div>'+
+      '<div style="background:#e8f4fd;border-radius:8px;padding:10px;text-align:center;"><div style="font-size:10px;color:#888;">Estoque Total</div><div style="font-size:22px;font-weight:800;color:#1a5276;">'+totalEstoque.toLocaleString('pt-BR')+'</div></div>'+
+      '<div style="background:#cce5ff;border-radius:8px;padding:10px;text-align:center;"><div style="font-size:10px;color:#888;">Vendas 30d</div><div style="font-size:22px;font-weight:800;color:#0d6efd;">'+totalVendas.toLocaleString('pt-BR')+'</div></div>'+
+    '</div>'+
+    (ignorados > 0 ? '<div style="font-size:11px;color:#888;margin-bottom:8px;">🚫 '+ignorados+' SKU(s) obsoleto(s) ignorado(s) (estoque total = 0)</div>' : '')+
+    '<div style="font-size:12px;color:#666;margin-bottom:8px;"><strong style="color:#27ae60;">'+novos+'</strong> novo(s) · <strong style="color:#17a2b8;">'+atualizados+'</strong> a atualizar</div>'+
+    '<div style="overflow-x:auto;max-height:350px;overflow-y:auto;">'+
+      '<table style="width:100%;border-collapse:collapse;font-size:11px;">'+
+        '<thead><tr style="background:#f8f9fa;position:sticky;top:0;">'+
+          '<th style="padding:6px 8px;text-align:left;">SKU</th>'+
+          '<th style="padding:6px 8px;text-align:left;">Produto</th>'+
+          '<th style="padding:6px 8px;text-align:center;color:#27ae60;">Aptas</th>'+
+          '<th style="padding:6px 8px;text-align:center;color:#f39c12;">Ent.Pend</th>'+
+          '<th style="padding:6px 8px;text-align:center;">Transf.</th>'+
+          '<th style="padding:6px 8px;text-align:center;">Devol.</th>'+
+          '<th style="padding:6px 8px;text-align:center;font-weight:800;">TOTAL</th>'+
+          '<th style="padding:6px 8px;text-align:center;">Vnd 30d</th>'+
+          '<th style="padding:6px 8px;text-align:center;">Status</th>'+
+          '<th style="padding:6px 8px;text-align:center;">Ação</th>'+
+        '</tr></thead>'+
+        '<tbody>'+rows+'</tbody>'+
+      '</table>'+
+    '</div>'+
+    '<div style="margin-top:14px;display:flex;justify-content:flex-end;gap:8px;">'+
+      '<button onclick="closeModal()" style="background:#e0e0e0;border:none;padding:8px 18px;border-radius:6px;cursor:pointer;font-size:12px;">Cancelar</button>'+
+      '<button onclick="confirmarImportMLFull()" style="background:#FFE600;color:#1a5276;border:none;padding:10px 26px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:800;">🛍️ IMPORTAR '+produtos.length+' SKUs</button>'+
+    '</div>'+
+  '</div>';
+  openModal('🛍️ Importar Estoque — Mercado Livre Full', body, null, '1000px');
+}
+
+function confirmarImportMLFull() {
+  var produtos = window._mlFullImportData;
+  if(!produtos || produtos.length === 0) return;
+
+  var skus = getSkus();
+  var movs = getMov();
+  var novos = 0, atualizados = 0;
+  var hoje = getToday();
+
+  produtos.forEach(function(p) {
+    // Buscar por SKU (chave principal)
+    var idx = skus.findIndex(function(s){ return s.sku === p.sku; });
+
+    if(idx >= 0) {
+      // Atualizar SKU existente
+      skus[idx].descricao = p.produto;
+      skus[idx].ml_code = p.cod_ml;
+      skus[idx].ean = p.ean;
+      skus[idx].vendas_30d = p.vendas_30d;
+      skus[idx].full_aptas = p.full_aptas;
+      skus[idx].full_a_caminho = p.full_a_caminho;
+      skus[idx].full_entrada_pend = p.full_entrada_pend;
+      skus[idx].full_em_transf = p.full_em_transf;
+      skus[idx].full_devolvidas = p.full_devolvidas;
+      skus[idx].tempo_esgotar = p.tempo_esgotar;
+      skus[idx].ml_atualizado_em = hoje;
+      // Ajustar posição: estoque total = aptas + entrada + transf + devolvidas
+      movs.push({
+        id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
+        data: hoje, qtd: p.estoque_total,
+        custo_unitario: skus[idx].custo_medio || 'R$ 0,00',
+        nfe: '', historico: 'ML Full: '+p.full_aptas+' aptas + '+p.full_entrada_pend+' ent.pend + '+p.full_em_transf+' transf + '+p.full_devolvidas+' devol = '+p.estoque_total,
+        _fonte: 'ml_full'
+      });
+      atualizados++;
+    } else {
+      // Criar novo SKU
+      var novoId = gerarIdEstoque();
+      skus.push({
+        id: novoId, sku: p.sku, descricao: p.produto,
+        unidade: 'un', custo_medio: 'R$ 0,00', estoque_minimo: 0,
+        fornecedor: '', localizacao: 'ML Full', observacao: '',
+        ml_code: p.cod_ml, ean: p.ean,
+        vendas_30d: p.vendas_30d, full_aptas: p.full_aptas,
+        full_a_caminho: p.full_a_caminho,
+        full_entrada_pend: p.full_entrada_pend,
+        full_em_transf: p.full_em_transf,
+        full_devolvidas: p.full_devolvidas,
+        tempo_esgotar: p.tempo_esgotar,
+        ml_atualizado_em: hoje, criado_em: hoje
+      });
+      // Movimentação de ajuste inicial
+      movs.push({
+        id: gerarIdMov(), sku_id: novoId, tipo: 'ajuste',
+        data: hoje, qtd: p.estoque_total, custo_unitario: 'R$ 0,00',
+        nfe: '', historico: 'Carga ML Full: '+p.full_aptas+' aptas + '+p.full_entrada_pend+' ent.pend + '+p.full_em_transf+' transf + '+p.full_devolvidas+' devol = '+p.estoque_total,
+        _fonte: 'ml_full'
+      });
+      novos++;
+    }
+  });
+
+  setSkus(skus);
+  setMovs(movs);
+  closeModal();
+  renderEstoque();
+  showToast('✅ Importação ML Full concluída! '+novos+' novo(s) · '+atualizados+' atualizado(s)');
+  window._mlFullImportData = null;
 }
 
 // ---- NF-e XML → Entrada ----
