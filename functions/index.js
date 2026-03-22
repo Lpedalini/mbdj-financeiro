@@ -709,15 +709,29 @@ const ML_CONFIG = {
   API_BASE: "https://api.mercadolibre.com",
 };
 
-// ── mlGetAuthUrl: retorna URL de autorização ──
+// ── mlGetAuthUrl: retorna URL de autorização (com PKCE) ──
 exports.mlGetAuthUrl = functions
   .runWith({ timeoutSeconds: 10, memory: "128MB" })
   .https.onCall(async (data, context) => {
-    const url = `${ML_CONFIG.AUTH_URL}?response_type=code&client_id=${ML_CONFIG.APP_ID}&redirect_uri=${encodeURIComponent(ML_CONFIG.REDIRECT_URI)}`;
+    const crypto = require("crypto");
+
+    // Gerar code_verifier (43-128 chars, base64url safe)
+    const codeVerifier = crypto.randomBytes(64).toString("base64url").substring(0, 128);
+
+    // Gerar code_challenge = SHA256(code_verifier) em base64url
+    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+
+    // Salvar code_verifier no Firestore (será usado no callback)
+    await db.collection("config").doc("ml_pkce").set({
+      code_verifier: codeVerifier,
+      criado_em: new Date().toISOString(),
+    });
+
+    const url = `${ML_CONFIG.AUTH_URL}?response_type=code&client_id=${ML_CONFIG.APP_ID}&redirect_uri=${encodeURIComponent(ML_CONFIG.REDIRECT_URI)}&code_challenge=${codeChallenge}&code_challenge_method=S256`;
     return { url };
   });
 
-// ── mlCallback: recebe o code do OAuth e troca por token ──
+// ── mlCallback: recebe o code do OAuth e troca por token (com PKCE) ──
 exports.mlCallback = functions
   .runWith({ timeoutSeconds: 30, memory: "256MB" })
   .https.onRequest(async (req, res) => {
@@ -728,6 +742,15 @@ exports.mlCallback = functions
     }
 
     try {
+      // Recuperar code_verifier do Firestore
+      const pkceDoc = await db.collection("config").doc("ml_pkce").get();
+      const codeVerifier = pkceDoc.exists ? pkceDoc.data().code_verifier : "";
+
+      if (!codeVerifier) {
+        res.status(400).send("Erro: code_verifier não encontrado. Tente conectar novamente.");
+        return;
+      }
+
       const fetch = (await import("node-fetch")).default;
       const response = await fetch(ML_CONFIG.TOKEN_URL, {
         method: "POST",
@@ -738,6 +761,7 @@ exports.mlCallback = functions
           client_secret: ML_CONFIG.SECRET_KEY,
           code: code,
           redirect_uri: ML_CONFIG.REDIRECT_URI,
+          code_verifier: codeVerifier,
         }),
       });
 
@@ -760,6 +784,9 @@ exports.mlCallback = functions
         obtido_em: new Date().toISOString(),
         expira_em: new Date(Date.now() + tokenData.expires_in * 1000).toISOString(),
       });
+
+      // Limpar PKCE
+      await db.collection("config").doc("ml_pkce").delete();
 
       console.log(`[mlCallback] Token obtido com sucesso. User ID: ${tokenData.user_id}`);
 
