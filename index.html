@@ -5300,8 +5300,8 @@ function conectarML() {
   var fn = firebase.functions().httpsCallable('mlGetAuthUrl');
   fn({}).then(function(result) {
     if(result.data && result.data.url) {
-      window.open(result.data.url, '_blank');
-      showToast('🔗 Janela de autorização aberta. Faça login no ML e autorize.');
+      localStorage.setItem('ml_code_verifier', result.data.code_verifier);
+      window.location.href = result.data.url;
     }
   }).catch(function(err) {
     showToast('❌ Erro: '+err.message, true);
@@ -5323,19 +5323,16 @@ function verificarStatusML() {
 }
 
 function sincronizarEstoqueML() {
-  // Primeiro verificar se está conectado
   var fnStatus = firebase.functions().httpsCallable('mlStatus');
   fnStatus({}).then(function(result) {
     var d = result.data;
     if(!d.connected) {
-      // Não conectado — perguntar se quer conectar
-      if(confirm('Mercado Livre não está conectado.\n\nDeseja conectar agora? Você será redirecionado para autorizar o acesso.')) {
+      if(confirm('Mercado Livre não está conectado.\n\nDeseja conectar agora?')) {
         conectarML();
       }
       return;
     }
 
-    // Conectado — confirmar sync
     showToast('⏳ Sincronizando estoque com ML... Pode levar até 1 minuto.');
     var btn = document.getElementById('btn-sync-ml');
     if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
@@ -5350,26 +5347,22 @@ function sincronizarEstoqueML() {
         return;
       }
 
-      // Importar produtos no estoque local
       var skus = getSkus();
       var movs = getMov();
       var novos = 0, atualizados = 0;
       var hoje = getToday();
 
       r.produtos.forEach(function(p) {
-        if(!p.sku) return; // SKU vazio, ignorar
-
+        if(!p.sku) return;
         var idx = skus.findIndex(function(s){ return s.sku === p.sku; });
 
         if(idx >= 0) {
-          // Atualizar
           skus[idx].ml_item_id = p.item_id;
           skus[idx].ml_inventory_id = p.inventory_id;
           skus[idx].full_aptas = p.full_aptas;
           skus[idx].full_a_caminho = 0;
           skus[idx].preco_ml = p.preco;
           skus[idx].ml_atualizado_em = hoje;
-          // Ajustar posição
           movs.push({
             id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
             data: hoje, qtd: p.full_aptas,
@@ -5379,7 +5372,6 @@ function sincronizarEstoqueML() {
           });
           atualizados++;
         } else {
-          // Criar novo SKU
           var novoId = gerarIdEstoque();
           skus.push({
             id: novoId, sku: p.sku, descricao: p.titulo,
@@ -5415,17 +5407,36 @@ function sincronizarEstoqueML() {
   });
 }
 
-// Detectar callback ML na URL (após autorização)
+// Detectar callback ML na URL
 (function checkMLCallback() {
   var params = new URLSearchParams(window.location.search);
-  if(params.get('ml_connected') === 'true') {
-    // Limpar URL
-    window.history.replaceState({}, document.title, window.location.pathname);
-    setTimeout(function() {
-      showToast('✅ Mercado Livre conectado com sucesso! Agora você pode sincronizar o estoque.');
-    }, 1500);
+  var mlCode = params.get('ml_code');
+  if(!mlCode) return;
+
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  var codeVerifier = localStorage.getItem('ml_code_verifier');
+  if(!codeVerifier) {
+    setTimeout(function(){ showToast('❌ code_verifier não encontrado. Tente conectar novamente.', true); }, 1500);
+    return;
   }
+
+  setTimeout(function() {
+    showToast('⏳ Finalizando conexão com Mercado Livre...');
+    var fn = firebase.functions().httpsCallable('mlExchangeToken');
+    fn({ code: mlCode, code_verifier: codeVerifier }).then(function(result) {
+      localStorage.removeItem('ml_code_verifier');
+      if(result.data && result.data.success) {
+        showToast('✅ Mercado Livre conectado com sucesso! Agora pode sincronizar o estoque.');
+      }
+    }).catch(function(err) {
+      localStorage.removeItem('ml_code_verifier');
+      showToast('❌ Erro ao conectar ML: '+err.message, true);
+      console.error('ML exchange error:', err);
+    });
+  }, 1500);
 })();
+
 
 function exportarEstoque(){
   var pos=calcularPosicao(getSkus(),getMov());
