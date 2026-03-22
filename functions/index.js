@@ -709,48 +709,27 @@ const ML_CONFIG = {
   API_BASE: "https://api.mercadolibre.com",
 };
 
-// ── mlGetAuthUrl: retorna URL de autorização (com PKCE) ──
+// ── mlGetAuthUrl: retorna URL de autorização + code_verifier (PKCE) ──
 exports.mlGetAuthUrl = functions
   .runWith({ timeoutSeconds: 10, memory: "128MB" })
   .https.onCall(async (data, context) => {
     const crypto = require("crypto");
-
-    // Gerar code_verifier (43-128 chars, base64url safe)
     const codeVerifier = crypto.randomBytes(64).toString("base64url").substring(0, 128);
-
-    // Gerar code_challenge = SHA256(code_verifier) em base64url
     const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
 
-    // Salvar code_verifier no Firestore (será usado no callback)
-    await db.collection("config").doc("ml_pkce").set({
-      code_verifier: codeVerifier,
-      criado_em: new Date().toISOString(),
-    });
-
     const url = `${ML_CONFIG.AUTH_URL}?response_type=code&client_id=${ML_CONFIG.APP_ID}&redirect_uri=${encodeURIComponent(ML_CONFIG.REDIRECT_URI)}&code_challenge=${codeChallenge}&code_challenge_method=S256`;
-    return { url };
+    return { url, code_verifier: codeVerifier };
   });
 
-// ── mlCallback: recebe o code do OAuth e troca por token (com PKCE) ──
-exports.mlCallback = functions
+// ── mlExchangeToken: troca code + code_verifier por token (chamado pelo frontend) ──
+exports.mlExchangeToken = functions
   .runWith({ timeoutSeconds: 30, memory: "256MB" })
-  .https.onRequest(async (req, res) => {
-    const code = req.query.code;
-    if (!code) {
-      res.status(400).send("Erro: código de autorização não recebido.");
-      return;
-    }
+  .https.onCall(async (data, context) => {
+    const { code, code_verifier } = data;
+    if (!code) throw new functions.https.HttpsError("invalid-argument", "Code não informado.");
+    if (!code_verifier) throw new functions.https.HttpsError("invalid-argument", "code_verifier não informado.");
 
     try {
-      // Recuperar code_verifier do Firestore
-      const pkceDoc = await db.collection("config").doc("ml_pkce").get();
-      const codeVerifier = pkceDoc.exists ? pkceDoc.data().code_verifier : "";
-
-      if (!codeVerifier) {
-        res.status(400).send("Erro: code_verifier não encontrado. Tente conectar novamente.");
-        return;
-      }
-
       const fetch = (await import("node-fetch")).default;
       const response = await fetch(ML_CONFIG.TOKEN_URL, {
         method: "POST",
@@ -761,19 +740,17 @@ exports.mlCallback = functions
           client_secret: ML_CONFIG.SECRET_KEY,
           code: code,
           redirect_uri: ML_CONFIG.REDIRECT_URI,
-          code_verifier: codeVerifier,
+          code_verifier: code_verifier,
         }),
       });
 
       const tokenData = await response.json();
 
       if (tokenData.error) {
-        console.error("[mlCallback] Erro:", tokenData);
-        res.status(400).send(`Erro ML: ${tokenData.error} - ${tokenData.message}`);
-        return;
+        console.error("[mlExchangeToken] Erro ML:", tokenData);
+        throw new functions.https.HttpsError("unknown", `ML: ${tokenData.error} - ${tokenData.message}`);
       }
 
-      // Salvar tokens no Firestore
       await db.collection("config").doc("ml_tokens").set({
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token,
@@ -785,17 +762,21 @@ exports.mlCallback = functions
         expira_em: new Date(Date.now() + tokenData.expires_in * 1000).toISOString(),
       });
 
-      // Limpar PKCE
-      await db.collection("config").doc("ml_pkce").delete();
-
-      console.log(`[mlCallback] Token obtido com sucesso. User ID: ${tokenData.user_id}`);
-
-      // Redirecionar de volta pro app com sucesso
-      res.redirect(`https://mbdj-financeiro.web.app/?ml_connected=true`);
+      console.log(`[mlExchangeToken] Token obtido! User ID: ${tokenData.user_id}`);
+      return { success: true, user_id: tokenData.user_id };
     } catch (err) {
-      console.error("[mlCallback] Erro:", err);
-      res.status(500).send(`Erro interno: ${err.message}`);
+      if (err instanceof functions.https.HttpsError) throw err;
+      console.error("[mlExchangeToken] Erro:", err);
+      throw new functions.https.HttpsError("internal", err.message);
     }
+  });
+
+// ── mlCallback: apenas redireciona de volta pro app com o code na URL ──
+exports.mlCallback = functions
+  .runWith({ timeoutSeconds: 10, memory: "128MB" })
+  .https.onRequest(async (req, res) => {
+    const code = req.query.code || "";
+    res.redirect(`https://mbdj-financeiro.web.app/?ml_code=${encodeURIComponent(code)}`);
   });
 
 // ── Função interna: obter access_token válido (com refresh automático) ──
