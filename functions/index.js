@@ -878,6 +878,23 @@ exports.mlSincronizarEstoque = functions
           if (wrapper.code !== 200 || !wrapper.body) continue;
           const item = wrapper.body;
 
+          // Helper: extrair SKU de um item/variação com múltiplos fallbacks
+          function extractSku(obj, item) {
+            // 1. seller_custom_field do objeto
+            if (obj.seller_custom_field) return obj.seller_custom_field;
+            // 2. Atributo SELLER_SKU nas attributes
+            if (obj.attributes) {
+              const skuAttr = obj.attributes.find(a => a.id === "SELLER_SKU");
+              if (skuAttr && skuAttr.value_name) return skuAttr.value_name;
+            }
+            // 3. seller_custom_field do item pai
+            if (item && item.seller_custom_field) return item.seller_custom_field;
+            // 4. inventory_id como fallback
+            if (obj.inventory_id) return obj.inventory_id;
+            // 5. Último recurso: item_id + variation_id
+            return item.id + (obj.id ? "_" + obj.id : "");
+          }
+
           // Item sem variação
           if (!item.variations || item.variations.length === 0) {
             const invId = item.inventory_id;
@@ -885,41 +902,40 @@ exports.mlSincronizarEstoque = functions
             if (invId) {
               try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
             }
+            const aptas = stockData ? (stockData.available_quantity || 0) : (item.available_quantity || 0);
             produtos.push({
               item_id: item.id,
               titulo: item.title,
-              sku: item.seller_custom_field || "",
+              sku: extractSku(item, item),
               preco: item.price,
               status: item.status,
               inventory_id: invId || "",
               available_quantity: item.available_quantity || 0,
-              full_aptas: stockData ? (stockData.available_quantity || 0) : 0,
+              full_aptas: aptas,
               full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
-              full_detail: stockData ? (stockData.not_available_detail || []) : [],
             });
           } else {
             // Item com variações
             for (const v of item.variations) {
               const invId = v.inventory_id;
-              const sku = (v.attributes || []).find(a => a.id === "SELLER_SKU");
               let stockData = null;
               if (invId) {
                 try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
               }
+              const aptas = stockData ? (stockData.available_quantity || 0) : (v.available_quantity || 0);
               produtos.push({
                 item_id: item.id,
                 variation_id: v.id,
                 titulo: item.title,
-                sku: sku ? sku.value_name : (v.seller_custom_field || ""),
+                sku: extractSku(v, item),
                 preco: item.price,
                 status: item.status,
                 inventory_id: invId || "",
                 available_quantity: v.available_quantity || 0,
-                full_aptas: stockData ? (stockData.available_quantity || 0) : 0,
+                full_aptas: aptas,
                 full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
-                full_detail: stockData ? (stockData.not_available_detail || []) : [],
               });
-              await sleep(100); // Rate limit
+              await sleep(100);
             }
           }
         }
@@ -928,6 +944,11 @@ exports.mlSincronizarEstoque = functions
 
       // 3. Filtrar apenas com estoque > 0
       const ativos = produtos.filter(p => p.full_aptas > 0 || p.available_quantity > 0);
+
+      // Log detalhado de SKUs
+      console.log(`[mlEstoque] SKUs ativos: ${ativos.map(p => p.sku + '(' + p.full_aptas + ')').join(', ')}`);
+      const semSku = produtos.filter(p => !p.sku || p.sku === "");
+      if (semSku.length > 0) console.log(`[mlEstoque] AVISO: ${semSku.length} itens sem SKU`);
 
       // 4. Salvar snapshot no Firestore
       await db.collection("config").doc("ml_estoque_sync").set({
@@ -989,30 +1010,4 @@ exports.mlStatus = functions
 
 // ── mlWebhook: recebe notificações do ML (vendas, estoque) ──
 exports.mlWebhook = functions
-  .runWith({ timeoutSeconds: 30, memory: "256MB" })
-  .https.onRequest(async (req, res) => {
-    if (req.method !== "POST") { res.status(200).send("OK"); return; }
-
-    try {
-      const notification = req.body;
-      console.log("[mlWebhook] Notificação:", JSON.stringify(notification));
-
-      // Salvar notificação para processamento
-      await db.collection("ml_notifications").add({
-        ...notification,
-        received_at: new Date().toISOString(),
-        processed: false,
-      });
-
-      res.status(200).send("OK");
-    } catch (err) {
-      console.error("[mlWebhook] Erro:", err);
-      res.status(200).send("OK"); // Sempre retorna 200 pro ML não reenviar
-    }
-  });
-
-// ══════════════════════════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════════════════════════
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
+  .runWith({ timeoutSeco
