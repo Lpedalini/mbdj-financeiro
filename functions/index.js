@@ -321,6 +321,7 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
 
   const dets = inf.getElementsByTagNameNS(ns, "det");
   const produtos = [];
+  let somaBcPIS = 0, somaBcCOFINS = 0, aliqPISItem = 0, aliqCOFINSItem = 0;
   for (let d = 0; d < dets.length; d++) {
     const prod = dets[d].getElementsByTagNameNS(ns, "prod");
     if (prod.length > 0) {
@@ -334,6 +335,21 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
         vUnit: getTagTextNS(prod[0], ns, "vUnCom"),
         vTotal: getTagTextNS(prod[0], ns, "vProd"),
       });
+    }
+    // Extrair base PIS/COFINS do item
+    const pisNodes = dets[d].getElementsByTagNameNS(ns, "PIS");
+    if (pisNodes.length > 0) {
+      const bcP = parseFloat(getTagTextNS(pisNodes[0], ns, "vBC")) || 0;
+      const alP = parseFloat(getTagTextNS(pisNodes[0], ns, "pPIS")) || 0;
+      somaBcPIS += bcP;
+      if (alP > 0) aliqPISItem = alP;
+    }
+    const cofNodes = dets[d].getElementsByTagNameNS(ns, "COFINS");
+    if (cofNodes.length > 0) {
+      const bcC = parseFloat(getTagTextNS(cofNodes[0], ns, "vBC")) || 0;
+      const alC = parseFloat(getTagTextNS(cofNodes[0], ns, "pCOFINS")) || 0;
+      somaBcCOFINS += bcC;
+      if (alC > 0) aliqCOFINSItem = alC;
     }
   }
 
@@ -357,7 +373,7 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     emitente: emitNome, emitenteCNPJ: emitCNPJ,
     destinatario: destNome, destinatarioCNPJ: destCNPJ,
     valor: valorTotal, chave, natOp, produtos, duplicatas,
-    impostos: { vICMS, vPIS, vCOFINS, vIPI, vST, vBC, vProd, vBCST },
+    impostos: { vICMS, vPIS, vCOFINS, vIPI, vST, vBC, vProd, vBCST, bcPIS: String(somaBcPIS), bcCOFINS: String(somaBcCOFINS), pPIS: String(aliqPISItem), pCOFINS: String(aliqCOFINSItem) },
     modFrete, xmlOriginal,
   };
 }
@@ -553,13 +569,21 @@ async function gerarCreditosTribServer(nfe) {
   const vCOFINS = parseFloat(impostos.vCOFINS) || 0;
   const vICMS = parseFloat(impostos.vICMS) || 0;
   const vBC = parseFloat(impostos.vBC) || 0;
-  const vProd = parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0;
+
+  // Bases reais PIS/COFINS (dos itens, excluem ICMS da base)
+  const bcPIS = parseFloat(impostos.bcPIS) || 0;
+  const bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
+  const pPIS = parseFloat(impostos.pPIS) || 0;
+  const pCOFINS = parseFloat(impostos.pCOFINS) || 0;
+
   if (vPIS === 0 && vCOFINS === 0 && vICMS === 0) return 0;
 
-  // Calcular alíquotas efetivas
-  const aliqPIS = vProd > 0 ? (vPIS / vProd * 100) : 0;
-  const aliqCOFINS = vProd > 0 ? (vCOFINS / vProd * 100) : 0;
+  // Alíquotas: priorizar a do XML, senão calcular pela base real
+  const aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS / bcPIS * 100) : 0);
+  const aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS / bcCOFINS * 100) : 0);
   const aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
+  const basePISExib = bcPIS > 0 ? bcPIS : (parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0);
+  const baseCOFINSExib = bcCOFINS > 0 ? bcCOFINS : (parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0);
 
   // Carregar créditos existentes
   const ctDoc = await db.collection("dados").doc("creditos_trib").get();
@@ -583,11 +607,11 @@ async function gerarCreditosTribServer(nfe) {
   let count = 0;
 
   if (vPIS > 0) {
-    ctItems.push({ imposto: "PIS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vPIS), baseCalculo: formatCurrencyBR(vProd), aliquota: aliqPIS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `PIS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
+    ctItems.push({ imposto: "PIS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vPIS), baseCalculo: formatCurrencyBR(basePISExib), aliquota: aliqPIS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `PIS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
     count++;
   }
   if (vCOFINS > 0) {
-    ctItems.push({ imposto: "COFINS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vCOFINS), baseCalculo: formatCurrencyBR(vProd), aliquota: aliqCOFINS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `COFINS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
+    ctItems.push({ imposto: "COFINS", natureza: "Crédito", competencia, valor: formatCurrencyBR(vCOFINS), baseCalculo: formatCurrencyBR(baseCOFINSExib), aliquota: aliqCOFINS.toFixed(2) + "%", nfRef: nfeRef, fornecedor, descricao: `COFINS s/ compra NF-e ${nfeRef} (CFOP ${cfopsStr})`, _chaveNFe: nfe.chave || "", _geradoAuto: true });
     count++;
   }
   if (vICMS > 0) {
@@ -670,6 +694,313 @@ exports.statusSefaz = functions
       cnpj: CONFIG.CNPJ,
       ambiente: CONFIG.AMBIENTE === "1" ? "Produção" : "Homologação",
     };
+  });
+
+// ══════════════════════════════════════════════════════════
+//  MERCADO LIVRE — INTEGRAÇÃO API
+// ══════════════════════════════════════════════════════════
+
+const ML_CONFIG = {
+  APP_ID: "3526571885666255",
+  SECRET_KEY: "IkCYM5wNRIJDPxv0ZKgu8NZwhjyZwBSN",
+  REDIRECT_URI: "https://mbdj-financeiro.web.app/auth/ml/callback",
+  AUTH_URL: "https://auth.mercadolivre.com.br/authorization",
+  TOKEN_URL: "https://api.mercadolibre.com/oauth/token",
+  API_BASE: "https://api.mercadolibre.com",
+};
+
+// ── mlGetAuthUrl: retorna URL de autorização ──
+exports.mlGetAuthUrl = functions
+  .runWith({ timeoutSeconds: 10, memory: "128MB" })
+  .https.onCall(async (data, context) => {
+    const url = `${ML_CONFIG.AUTH_URL}?response_type=code&client_id=${ML_CONFIG.APP_ID}&redirect_uri=${encodeURIComponent(ML_CONFIG.REDIRECT_URI)}`;
+    return { url };
+  });
+
+// ── mlCallback: recebe o code do OAuth e troca por token ──
+exports.mlCallback = functions
+  .runWith({ timeoutSeconds: 30, memory: "256MB" })
+  .https.onRequest(async (req, res) => {
+    const code = req.query.code;
+    if (!code) {
+      res.status(400).send("Erro: código de autorização não recebido.");
+      return;
+    }
+
+    try {
+      const fetch = (await import("node-fetch")).default;
+      const response = await fetch(ML_CONFIG.TOKEN_URL, {
+        method: "POST",
+        headers: { "accept": "application/json", "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: ML_CONFIG.APP_ID,
+          client_secret: ML_CONFIG.SECRET_KEY,
+          code: code,
+          redirect_uri: ML_CONFIG.REDIRECT_URI,
+        }),
+      });
+
+      const tokenData = await response.json();
+
+      if (tokenData.error) {
+        console.error("[mlCallback] Erro:", tokenData);
+        res.status(400).send(`Erro ML: ${tokenData.error} - ${tokenData.message}`);
+        return;
+      }
+
+      // Salvar tokens no Firestore
+      await db.collection("config").doc("ml_tokens").set({
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        token_type: tokenData.token_type,
+        expires_in: tokenData.expires_in,
+        user_id: tokenData.user_id,
+        scope: tokenData.scope,
+        obtido_em: new Date().toISOString(),
+        expira_em: new Date(Date.now() + tokenData.expires_in * 1000).toISOString(),
+      });
+
+      console.log(`[mlCallback] Token obtido com sucesso. User ID: ${tokenData.user_id}`);
+
+      // Redirecionar de volta pro app com sucesso
+      res.redirect(`https://mbdj-financeiro.web.app/?ml_connected=true`);
+    } catch (err) {
+      console.error("[mlCallback] Erro:", err);
+      res.status(500).send(`Erro interno: ${err.message}`);
+    }
+  });
+
+// ── Função interna: obter access_token válido (com refresh automático) ──
+async function getMLToken() {
+  const doc = await db.collection("config").doc("ml_tokens").get();
+  if (!doc.exists) throw new Error("ML não conectado. Faça a autorização primeiro.");
+
+  const data = doc.data();
+  const expiraEm = new Date(data.expira_em);
+
+  // Se ainda válido (com 5min de margem), retorna direto
+  if (expiraEm > new Date(Date.now() + 300000)) {
+    return data.access_token;
+  }
+
+  // Refresh
+  console.log("[ML] Token expirado, renovando...");
+  const fetch = (await import("node-fetch")).default;
+  const response = await fetch(ML_CONFIG.TOKEN_URL, {
+    method: "POST",
+    headers: { "accept": "application/json", "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: ML_CONFIG.APP_ID,
+      client_secret: ML_CONFIG.SECRET_KEY,
+      refresh_token: data.refresh_token,
+    }),
+  });
+
+  const tokenData = await response.json();
+  if (tokenData.error) throw new Error(`Erro refresh ML: ${tokenData.error} - ${tokenData.message}`);
+
+  await db.collection("config").doc("ml_tokens").set({
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+    token_type: tokenData.token_type,
+    expires_in: tokenData.expires_in,
+    user_id: tokenData.user_id,
+    scope: tokenData.scope,
+    obtido_em: new Date().toISOString(),
+    expira_em: new Date(Date.now() + tokenData.expires_in * 1000).toISOString(),
+  });
+
+  console.log("[ML] Token renovado com sucesso.");
+  return tokenData.access_token;
+}
+
+// ── Função interna: chamada genérica à API do ML ──
+async function mlApiGet(endpoint) {
+  const token = await getMLToken();
+  const fetch = (await import("node-fetch")).default;
+  const url = endpoint.startsWith("http") ? endpoint : `${ML_CONFIG.API_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    headers: { "Authorization": `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`ML API ${response.status}: ${err}`);
+  }
+  return response.json();
+}
+
+// ── mlSincronizarEstoque: consulta estoque Full de todos os itens ──
+exports.mlSincronizarEstoque = functions
+  .runWith({ timeoutSeconds: 120, memory: "512MB" })
+  .https.onCall(async (data, context) => {
+    const startTime = Date.now();
+
+    try {
+      const token = await getMLToken();
+      const tokenDoc = await db.collection("config").doc("ml_tokens").get();
+      const sellerId = tokenDoc.data().user_id;
+
+      // 1. Buscar todos os itens do seller
+      let allItems = [];
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const result = await mlApiGet(`/users/${sellerId}/items/search?offset=${offset}&limit=50`);
+        allItems = allItems.concat(result.results || []);
+        offset += 50;
+        hasMore = offset < (result.paging ? result.paging.total : 0);
+        if (hasMore) await sleep(200);
+      }
+
+      console.log(`[mlEstoque] ${allItems.length} itens encontrados`);
+
+      // 2. Para cada item, buscar detalhes e estoque
+      const produtos = [];
+      const batchSize = 20; // API aceita multiget de até 20
+
+      for (let i = 0; i < allItems.length; i += batchSize) {
+        const batch = allItems.slice(i, i + batchSize);
+        const ids = batch.join(",");
+        const itemsData = await mlApiGet(`/items?ids=${ids}`);
+
+        for (const wrapper of itemsData) {
+          if (wrapper.code !== 200 || !wrapper.body) continue;
+          const item = wrapper.body;
+
+          // Item sem variação
+          if (!item.variations || item.variations.length === 0) {
+            const invId = item.inventory_id;
+            let stockData = null;
+            if (invId) {
+              try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
+            }
+            produtos.push({
+              item_id: item.id,
+              titulo: item.title,
+              sku: item.seller_custom_field || "",
+              preco: item.price,
+              status: item.status,
+              inventory_id: invId || "",
+              available_quantity: item.available_quantity || 0,
+              full_aptas: stockData ? (stockData.available_quantity || 0) : 0,
+              full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
+              full_detail: stockData ? (stockData.not_available_detail || []) : [],
+            });
+          } else {
+            // Item com variações
+            for (const v of item.variations) {
+              const invId = v.inventory_id;
+              const sku = (v.attributes || []).find(a => a.id === "SELLER_SKU");
+              let stockData = null;
+              if (invId) {
+                try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
+              }
+              produtos.push({
+                item_id: item.id,
+                variation_id: v.id,
+                titulo: item.title,
+                sku: sku ? sku.value_name : (v.seller_custom_field || ""),
+                preco: item.price,
+                status: item.status,
+                inventory_id: invId || "",
+                available_quantity: v.available_quantity || 0,
+                full_aptas: stockData ? (stockData.available_quantity || 0) : 0,
+                full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
+                full_detail: stockData ? (stockData.not_available_detail || []) : [],
+              });
+              await sleep(100); // Rate limit
+            }
+          }
+        }
+        await sleep(300);
+      }
+
+      // 3. Filtrar apenas com estoque > 0
+      const ativos = produtos.filter(p => p.full_aptas > 0 || p.available_quantity > 0);
+
+      // 4. Salvar snapshot no Firestore
+      await db.collection("config").doc("ml_estoque_sync").set({
+        ultima_sincronizacao: new Date().toISOString(),
+        total_itens: allItems.length,
+        total_skus: produtos.length,
+        total_ativos: ativos.length,
+        duracao_seg: ((Date.now() - startTime) / 1000).toFixed(1),
+      });
+
+      const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[mlEstoque] Concluído em ${duracao}s: ${ativos.length} SKUs ativos de ${produtos.length} total`);
+
+      return {
+        success: true,
+        total_itens: allItems.length,
+        total_skus: produtos.length,
+        total_ativos: ativos.length,
+        produtos: ativos,
+        duracao: duracao,
+      };
+    } catch (err) {
+      console.error("[mlEstoque] Erro:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+// ── mlStatus: verifica status da conexão ML ──
+exports.mlStatus = functions
+  .runWith({ timeoutSeconds: 10, memory: "128MB" })
+  .https.onCall(async (data, context) => {
+    const doc = await db.collection("config").doc("ml_tokens").get();
+    if (!doc.exists) return { connected: false };
+
+    const d = doc.data();
+    const expirado = new Date(d.expira_em) < new Date();
+    let userName = "";
+
+    if (!expirado) {
+      try {
+        const user = await mlApiGet("/users/me");
+        userName = user.nickname || user.first_name || "";
+      } catch (e) { /* ignora */ }
+    }
+
+    const syncDoc = await db.collection("config").doc("ml_estoque_sync").get();
+    const lastSync = syncDoc.exists ? syncDoc.data() : null;
+
+    return {
+      connected: true,
+      user_id: d.user_id,
+      user_name: userName,
+      token_expira: d.expira_em,
+      token_expirado: expirado,
+      ultima_sincronizacao: lastSync ? lastSync.ultima_sincronizacao : null,
+      total_skus_sync: lastSync ? lastSync.total_ativos : 0,
+    };
+  });
+
+// ── mlWebhook: recebe notificações do ML (vendas, estoque) ──
+exports.mlWebhook = functions
+  .runWith({ timeoutSeconds: 30, memory: "256MB" })
+  .https.onRequest(async (req, res) => {
+    if (req.method !== "POST") { res.status(200).send("OK"); return; }
+
+    try {
+      const notification = req.body;
+      console.log("[mlWebhook] Notificação:", JSON.stringify(notification));
+
+      // Salvar notificação para processamento
+      await db.collection("ml_notifications").add({
+        ...notification,
+        received_at: new Date().toISOString(),
+        processed: false,
+      });
+
+      res.status(200).send("OK");
+    } catch (err) {
+      console.error("[mlWebhook] Erro:", err);
+      res.status(200).send("OK"); // Sempre retorna 200 pro ML não reenviar
+    }
   });
 
 // ══════════════════════════════════════════════════════════
