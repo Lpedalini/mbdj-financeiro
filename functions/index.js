@@ -1,6 +1,14 @@
 /**
- * MBDJ — Cloud Functions: SEFAZ + Mercado Livre
- * v2.2 — Fix certificado A1 legado (PKCS12 com RC2/3DES)
+ * MBDJ — Cloud Functions: SEFAZ + Mercado Livre + Mercado Pago
+ * v2.3 — Integração Mercado Pago (saldo + lançamentos futuros)
+ * 
+ * Changelog v2.3:
+ *   - NOVO: mpSincronizar — puxa saldo MP + calendário de lançamentos futuros
+ *     → Usa mesmo token OAuth do ML (mesma plataforma)
+ *     → Balance: disponível + a liberar
+ *     → Pedidos: busca payments com money_release_date
+ *     → Calendário: agrupa por dia, retorna bruto/taxas/líquido
+ *     → Salva snapshot no Firestore (config/mp_sync + config/mp_calendario)
  * 
  * Changelog v2.2:
  *   - Fix CRÍTICO: "Unsupported PKCS12 PFX data" em Node.js 18+
@@ -1075,14 +1083,4 @@ exports.mlWebhook = functions
         ...notification, received_at: new Date().toISOString(), processed: false,
       });
       res.status(200).send("OK");
-    } catch (err) {
-      console.error("[mlWebhook] Erro:", err);
-      res.status(200).send("OK");
-    }
-  });
-
-// ══════════════════════════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════════════════════════
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
+    } catch (err)
