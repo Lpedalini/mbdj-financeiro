@@ -1188,6 +1188,14 @@ exports.mpSincronizar = functions
 
       console.log(`[mpSync v2] ${allPayments.length} payments encontrados`);
 
+      // Debug: logar estrutura do primeiro payment pra identificar campos
+      if (allPayments.length > 0) {
+        const sample = allPayments[0];
+        console.log(`[mpSync v2] SAMPLE payment id=${sample.id}: transaction_amount=${sample.transaction_amount}, net_received_amount=${sample.net_received_amount}, td.net=${sample.transaction_details ? sample.transaction_details.net_received_amount : 'N/A'}, money_release_date=${sample.money_release_date}, money_release_status=${sample.money_release_status}, status=${sample.status}`);
+        console.log(`[mpSync v2] SAMPLE fee_details: ${JSON.stringify(sample.fee_details || [])}`);
+        console.log(`[mpSync v2] SAMPLE transaction_details: ${JSON.stringify(sample.transaction_details || {})}`);
+      }
+
       // ── 3. AGRUPAR POR DATA DE LIBERAÇÃO ──
       const paymentMap = {};
       let totalAReceber = 0;
@@ -1200,8 +1208,10 @@ exports.mpSincronizar = functions
         const relDateStr = releaseDate.substring(0, 10);
         const relHora = releaseDate.substring(11, 16) || "";
 
-        // net_received_amount = valor exato que cai na conta (já com todos os descontos)
-        const netAmount = pmt.net_received_amount || 0;
+        // net_received_amount pode estar em transaction_details ou direto no payment
+        const tdNet = pmt.transaction_details ? (pmt.transaction_details.net_received_amount || 0) : 0;
+        const directNet = pmt.net_received_amount || 0;
+        const netAmount = tdNet || directNet || 0;
         const grossAmount = pmt.transaction_amount || 0;
         const taxas = grossAmount - netAmount;
 
