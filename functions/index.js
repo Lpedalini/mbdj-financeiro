@@ -1083,4 +1083,204 @@ exports.mlWebhook = functions
         ...notification, received_at: new Date().toISOString(), processed: false,
       });
       res.status(200).send("OK");
-    } catch (err)
+    } catch (err) {
+      console.error("[mlWebhook] Erro:", err);
+      res.status(200).send("OK");
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  MERCADO PAGO — SALDO + LANÇAMENTOS FUTUROS (v2)
+// ══════════════════════════════════════════════════════════
+
+/**
+ * mpSincronizar v2 — Usa payments/search com net_received_amount
+ * 
+ * Em vez de calcular líquido manualmente, usa o campo net_received_amount
+ * que é o valor exato que o MP libera na conta do seller.
+ * 
+ * Endpoint: GET /v1/payments/search?range=money_release_date&begin_date=NOW&end_date=NOW+30DAYS
+ * Cada payment retorna: money_release_date, net_received_amount, transaction_amount
+ */
+exports.mpSincronizar = functions
+  .runWith({ timeoutSeconds: 120, memory: "512MB" })
+  .https.onCall(async (data, context) => {
+    const startTime = Date.now();
+
+    try {
+      const token = await getMLToken();
+      const tokenDoc = await db.collection("config").doc("ml_tokens").get();
+      const sellerId = tokenDoc.data().user_id;
+      const fetch = (await import("node-fetch")).default;
+
+      console.log(`[mpSync v2] Iniciado para seller ${sellerId}`);
+
+      // ── 1. SALDO DA CONTA ──
+      let balance = { available: 0, unavailable: 0, total: 0 };
+      try {
+        const balRes = await fetch(
+          `${ML_CONFIG.API_BASE}/users/${sellerId}/mercadopago_account/balance`,
+          { headers: { "Authorization": `Bearer ${token}` } }
+        );
+        if (balRes.ok) {
+          const b = await balRes.json();
+          balance = {
+            available: b.available_balance || 0,
+            unavailable: b.unavailable_balance || 0,
+            total: (b.available_balance || 0) + (b.unavailable_balance || 0),
+          };
+          console.log(`[mpSync v2] Saldo: disponivel=${balance.available}, a liberar=${balance.unavailable}`);
+        } else {
+          const errText = await balRes.text();
+          console.warn(`[mpSync v2] Balance API ${balRes.status}: ${errText.substring(0, 200)}`);
+        }
+      } catch (e) {
+        console.warn("[mpSync v2] Erro saldo:", e.message);
+      }
+
+      // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (próximos 35 dias) ──
+      const hoje = new Date();
+      const hojeStr = hoje.toISOString().split("T")[0];
+      const ate35 = new Date(hoje);
+      ate35.setDate(ate35.getDate() + 35);
+
+      let allPayments = [];
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore && offset < 2000) {
+        const url = `https://api.mercadopago.com/v1/payments/search?` +
+          `sort=money_release_date&criteria=asc` +
+          `&range=money_release_date` +
+          `&begin_date=NOW-1DAYS` +
+          `&end_date=NOW+35DAYS` +
+          `&status=approved` +
+          `&offset=${offset}&limit=50`;
+
+        try {
+          const res = await fetch(url, {
+            headers: { "Authorization": `Bearer ${token}` },
+          });
+
+          if (!res.ok) {
+            const errText = await res.text();
+            console.warn(`[mpSync v2] Payments search ${res.status} offset ${offset}: ${errText.substring(0, 200)}`);
+            break;
+          }
+
+          const pmtData = await res.json();
+          const results = pmtData.results || [];
+          allPayments = allPayments.concat(results);
+          offset += 50;
+          hasMore = offset < (pmtData.paging ? pmtData.paging.total : 0);
+          if (hasMore) await sleep(300);
+        } catch (e) {
+          console.warn(`[mpSync v2] Erro payments offset ${offset}:`, e.message);
+          break;
+        }
+      }
+
+      console.log(`[mpSync v2] ${allPayments.length} payments encontrados`);
+
+      // ── 3. AGRUPAR POR DATA DE LIBERAÇÃO ──
+      const paymentMap = {};
+      let totalAReceber = 0;
+      let totalAPagar = 0;
+
+      for (const pmt of allPayments) {
+        const releaseDate = pmt.money_release_date;
+        if (!releaseDate) continue;
+
+        const relDateStr = releaseDate.substring(0, 10);
+        const relHora = releaseDate.substring(11, 16) || "";
+
+        // net_received_amount = valor exato que cai na conta (já com todos os descontos)
+        const netAmount = pmt.net_received_amount || 0;
+        const grossAmount = pmt.transaction_amount || 0;
+        const taxas = grossAmount - netAmount;
+
+        if (netAmount >= 0) {
+          totalAReceber += netAmount;
+        } else {
+          totalAPagar += Math.abs(netAmount);
+        }
+
+        if (!paymentMap[relDateStr]) {
+          paymentMap[relDateStr] = { total: 0, bruto: 0, taxas: 0, lancamentos: [] };
+        }
+        paymentMap[relDateStr].total += netAmount;
+        paymentMap[relDateStr].bruto += grossAmount;
+        paymentMap[relDateStr].taxas += taxas;
+
+        // Guardar até 10 lançamentos por dia (pra não estourar o payload)
+        if (paymentMap[relDateStr].lancamentos.length < 10) {
+          paymentMap[relDateStr].lancamentos.push({
+            payment_id: pmt.id,
+            descricao: pmt.description || "Liberação de dinheiro",
+            bruto: grossAmount,
+            liquido: netAmount,
+            taxas: taxas,
+            hora: relHora,
+          });
+        }
+      }
+
+      // ── 4. MONTAR CALENDÁRIO ORDENADO ──
+      const calendario = Object.keys(paymentMap)
+        .sort()
+        .map(dt => ({
+          data: dt,
+          total: paymentMap[dt].total,
+          bruto: paymentMap[dt].bruto,
+          taxas: paymentMap[dt].taxas,
+          qtd_lancamentos: paymentMap[dt].lancamentos.length,
+          lancamentos: paymentMap[dt].lancamentos,
+        }));
+
+      const calendarioFuturo = calendario.filter(d => d.data >= hojeStr);
+      const calendarioPassado = calendario.filter(d => d.data < hojeStr);
+
+      // ── 5. SALVAR NO FIRESTORE ──
+      await db.collection("config").doc("mp_sync").set({
+        ultima_sincronizacao: new Date().toISOString(),
+        balance,
+        total_a_receber: totalAReceber,
+        total_a_pagar: totalAPagar,
+        total_pagamentos: allPayments.length,
+      });
+
+      await db.collection("config").doc("mp_calendario").set({
+        atualizado_em: new Date().toISOString(),
+        calendario: JSON.stringify(calendario),
+      });
+
+      const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[mpSync v2] Concluido em ${duracao}s: ${allPayments.length} payments, ${calendarioFuturo.length} dias futuros, total a receber: ${totalAReceber}`);
+
+      return {
+        success: true,
+        duracao,
+        balance,
+        resumo: {
+          total_a_receber: totalAReceber,
+          total_a_pagar: totalAPagar,
+          saldo_projetado: balance.available + totalAReceber - totalAPagar,
+          total_pagamentos: allPayments.length,
+        },
+        calendario_futuro: calendarioFuturo.slice(0, 60),
+        calendario_passado_resumo: {
+          dias: calendarioPassado.length,
+          total: calendarioPassado.reduce((s, d) => s + d.total, 0),
+        },
+      };
+    } catch (err) {
+      console.error("[mpSync v2] Erro:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
