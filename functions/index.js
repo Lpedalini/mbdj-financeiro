@@ -1,16 +1,19 @@
 /**
- * MBDJ — Cloud Function: Consulta NF-e via SEFAZ Distribuição de DF-e
- * v2.1 — Correções e melhorias
+ * MBDJ — Cloud Functions: SEFAZ + Mercado Livre
+ * v2.2 — Fix certificado A1 legado (PKCS12 com RC2/3DES)
+ * 
+ * Changelog v2.2:
+ *   - Fix CRÍTICO: "Unsupported PKCS12 PFX data" em Node.js 18+
+ *     → Usa node-forge para extrair cert+chave do PFX legado
+ *     → Passa PEM (não PFX) para tls.createSecureContext
+ *   - uploadCertificado agora valida via node-forge (não tls)
+ *   - Cache converte PFX→PEM uma vez e reutiliza
  * 
  * Changelog v2.1:
- *   - Fix: sintaxe do objeto options em callSefaz (faltava fechar })
- *   - Melhoria: cache do certificado em memória (evita ler Firestore a cada chamada SOAP)
- *   - Melhoria: retry automático com backoff em caso de erro temporário da SEFAZ
- *   - Melhoria: extração de impostos detalhados (ICMS, PIS, COFINS, IPI, ST)
- *   - Melhoria: validação real do PFX no upload (tenta criar SecureContext)
- *   - Melhoria: tratamento do cStat 656 (rate limit SEFAZ) sem erro
- *   - Melhoria: retorna lista de NF-e importadas ao frontend
- *   - Melhoria: log com duração de cada etapa
+ *   - Cache do certificado em memória
+ *   - Retry automático com backoff
+ *   - Extração de impostos detalhados
+ *   - Tratamento cStat 656 (rate limit)
  */
 
 const functions = require("firebase-functions");
@@ -18,6 +21,7 @@ const admin = require("firebase-admin");
 const https = require("https");
 const tls = require("tls");
 const zlib = require("zlib");
+const forge = require("node-forge");
 const { DOMParser } = require("@xmldom/xmldom");
 
 admin.initializeApp();
@@ -39,14 +43,58 @@ const CONFIG = {
 };
 
 // ══════════════════════════════════════════════════════════
-//  CACHE DE CERTIFICADO EM MEMÓRIA
+//  CACHE DE CERTIFICADO EM MEMÓRIA (PEM convertido)
 // ══════════════════════════════════════════════════════════
 let _certCache = null;
 
+/**
+ * Converte PFX (que pode usar algoritmos legados RC2/3DES)
+ * para PEM usando node-forge, que lida com esses formatos.
+ * O Node.js 18+ recusa PFX legado via tls.createSecureContext.
+ */
+function pfxToPem(pfxBuffer, password) {
+  // Decode o PFX com node-forge
+  const pfxAsn1 = forge.asn1.fromDer(pfxBuffer.toString("binary"));
+  const pfx = forge.pkcs12.pkcs12FromAsn1(pfxAsn1, false, password);
+
+  // Extrair certificados
+  const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag });
+  const certs = certBags[forge.pki.oids.certBag] || [];
+  if (certs.length === 0) {
+    throw new Error("Nenhum certificado encontrado no PFX.");
+  }
+
+  // Extrair chave privada
+  const keyBags = pfx.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+  const keys = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag] || [];
+  if (keys.length === 0) {
+    throw new Error("Nenhuma chave privada encontrada no PFX.");
+  }
+
+  // Converter para PEM
+  const certPem = certs.map(bag => forge.pki.certificateToPem(bag.cert)).join("\n");
+  const keyPem = forge.pki.privateKeyToPem(keys[0].key);
+
+  // Extrair info do certificado para log
+  const mainCert = certs[0].cert;
+  const cn = mainCert.subject.getField("CN");
+  const notAfter = mainCert.validity.notAfter;
+
+  return {
+    cert: certPem,
+    key: keyPem,
+    cn: cn ? cn.value : "N/A",
+    expiraEm: notAfter.toISOString(),
+    expirado: notAfter < new Date(),
+  };
+}
+
 async function getCertificado() {
+  // Cache válido por 5 minutos
   if (_certCache && (Date.now() - _certCache.loadedAt) < 300000) {
     return _certCache;
   }
+
   const doc = await db.collection("config").doc("sefaz_cert").get();
   if (!doc.exists || !doc.data().pfx_base64) {
     throw new Error("Certificado A1 não encontrado. Faça upload em Config SEFAZ.");
@@ -54,11 +102,28 @@ async function getCertificado() {
   if (!doc.data().password) {
     throw new Error("Senha do certificado não encontrada.");
   }
+
+  const pfxBuffer = Buffer.from(doc.data().pfx_base64, "base64");
+  const password = doc.data().password;
+
+  // Converter PFX legado → PEM via node-forge
+  const pem = pfxToPem(pfxBuffer, password);
+
+  if (pem.expirado) {
+    console.warn(`[CERT] ⚠️ Certificado EXPIRADO! CN=${pem.cn}, expirou em ${pem.expiraEm}`);
+    throw new Error(`Certificado A1 expirado em ${pem.expiraEm.substring(0, 10)}. Renove o certificado.`);
+  }
+
+  console.log(`[CERT] Certificado carregado: CN=${pem.cn}, expira em ${pem.expiraEm.substring(0, 10)}`);
+
   _certCache = {
-    pfx: Buffer.from(doc.data().pfx_base64, "base64"),
-    pass: doc.data().password,
+    cert: pem.cert,
+    key: pem.key,
+    cn: pem.cn,
+    expiraEm: pem.expiraEm,
     loadedAt: Date.now(),
   };
+
   return _certCache;
 }
 
@@ -111,14 +176,18 @@ function buildSoapConsChNFe(chaveNFe, cnpj, uf, ambiente) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  CHAMADA SOAP COM CERTIFICADO A1 + RETRY
+//  CHAMADA SOAP COM CERTIFICADO A1 (PEM) + RETRY
 // ══════════════════════════════════════════════════════════
 async function callSefaz(soapBody) {
   const cert = await getCertificado();
   const url = CONFIG.AMBIENTE === "1" ? CONFIG.URL_PROD : CONFIG.URL_HOMOLOG;
   const parsedUrl = new URL(url);
 
-  const sslContext = tls.createSecureContext({ pfx: cert.pfx, passphrase: cert.pass });
+  // ✅ Usa PEM (cert + key) em vez de PFX — compatível com Node 18+
+  const sslContext = tls.createSecureContext({
+    cert: cert.cert,
+    key: cert.key,
+  });
   const agent = new https.Agent({ secureContext: sslContext });
 
   const options = {
@@ -272,7 +341,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     natOp = getTagTextNS(ide[0], ns, "natOp");
   }
 
-  // emit - emitente
   const emit = inf.getElementsByTagNameNS(ns, "emit");
   let emitNome = "", emitCNPJ = "";
   if (emit.length > 0) {
@@ -282,7 +350,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     emitCNPJ = getTagTextNS(emit[0], ns, "CNPJ") || getTagTextNS(emit[0], ns, "CPF");
   }
 
-  // dest - destinatário
   const dest = inf.getElementsByTagNameNS(ns, "dest");
   let destNome = "", destCNPJ = "";
   if (dest.length > 0) {
@@ -292,7 +359,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
     destCNPJ = getTagTextNS(dest[0], ns, "CNPJ") || getTagTextNS(dest[0], ns, "CPF");
   }
 
-  // Identificar contraparte: se MBDJ é emitente, contraparte é destinatário
   const emitCNPJLimpo = (emitCNPJ || "").replace(/[.\-\/]/g, "");
   let fornNome, fornCNPJ;
   if (emitCNPJLimpo === CONFIG.CNPJ) {
@@ -336,7 +402,6 @@ function parseNFeCompleta(doc, ns, xmlOriginal) {
         vTotal: getTagTextNS(prod[0], ns, "vProd"),
       });
     }
-    // Extrair base PIS/COFINS do item
     const pisNodes = dets[d].getElementsByTagNameNS(ns, "PIS");
     if (pisNodes.length > 0) {
       const bcP = parseFloat(getTagTextNS(pisNodes[0], ns, "vBC")) || 0;
@@ -544,9 +609,7 @@ async function salvarNFeNoFirestore(nfe) {
   }
   console.log(`[salvarNFe] NF-e ${nfe.numero} salva (total: ${nfeItems.length})`);
 
-  // Gerar créditos tributários automaticamente (se aplicável)
   await gerarCreditosTribServer(nfe);
-
   return true;
 }
 
@@ -556,7 +619,6 @@ async function salvarNFeNoFirestore(nfe) {
 const CFOPS_CREDITO = ['5401','5403','5405','6401','6403','6405','1401','1403','2401','2403'];
 
 async function gerarCreditosTribServer(nfe) {
-  // Só gera se MBDJ é destinatário (emitente ≠ MBDJ)
   const emitCNPJLimpo = (nfe.emitenteCNPJ || nfe.cnpj || "").replace(/[.\-\/]/g, "");
   if (emitCNPJLimpo === CONFIG.CNPJ) return 0;
 
@@ -570,7 +632,6 @@ async function gerarCreditosTribServer(nfe) {
   const vICMS = parseFloat(impostos.vICMS) || 0;
   const vBC = parseFloat(impostos.vBC) || 0;
 
-  // Bases reais PIS/COFINS (dos itens, excluem ICMS da base)
   const bcPIS = parseFloat(impostos.bcPIS) || 0;
   const bcCOFINS = parseFloat(impostos.bcCOFINS) || 0;
   const pPIS = parseFloat(impostos.pPIS) || 0;
@@ -578,14 +639,12 @@ async function gerarCreditosTribServer(nfe) {
 
   if (vPIS === 0 && vCOFINS === 0 && vICMS === 0) return 0;
 
-  // Alíquotas: priorizar a do XML, senão calcular pela base real
   const aliqPIS = pPIS > 0 ? pPIS : (bcPIS > 0 ? (vPIS / bcPIS * 100) : 0);
   const aliqCOFINS = pCOFINS > 0 ? pCOFINS : (bcCOFINS > 0 ? (vCOFINS / bcCOFINS * 100) : 0);
   const aliqICMS = vBC > 0 ? (vICMS / vBC * 100) : 0;
   const basePISExib = bcPIS > 0 ? bcPIS : (parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0);
   const baseCOFINSExib = bcCOFINS > 0 ? bcCOFINS : (parseFloat(impostos.vProd) || parseFloat(nfe.valor) || 0);
 
-  // Carregar créditos existentes
   const ctDoc = await db.collection("dados").doc("creditos_trib").get();
   let ctItems = [];
   if (ctDoc.exists) {
@@ -662,16 +721,43 @@ exports.uploadCertificado = functions
       const pfxBuffer = Buffer.from(pfxBase64, "base64");
       if (pfxBuffer.length < 100) throw new Error("Arquivo muito pequeno para ser um PFX válido");
       if (pfxBuffer.length > 50000) throw new Error("Arquivo muito grande (max 50KB)");
-      tls.createSecureContext({ pfx: pfxBuffer, passphrase: password });
+
+      // ✅ Valida via node-forge (suporta PFX legado com RC2/3DES)
+      const pem = pfxToPem(pfxBuffer, password);
+
+      const info = {
+        cn: pem.cn,
+        expiraEm: pem.expiraEm,
+        expirado: pem.expirado,
+      };
+
+      if (pem.expirado) {
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          `Certificado expirado em ${pem.expiraEm.substring(0, 10)}. Renove o certificado A1.`
+        );
+      }
+
+      console.log(`[uploadCert] Certificado válido: CN=${pem.cn}, expira em ${pem.expiraEm.substring(0, 10)}`);
     } catch (e) {
+      if (e instanceof functions.https.HttpsError) throw e;
       const msg = e.message || "";
-      if (msg.includes("mac verify failure") || msg.includes("bad decrypt")) throw new functions.https.HttpsError("invalid-argument", "Senha do certificado incorreta.");
-      if (msg.includes("routines") || msg.includes("asn1")) throw new functions.https.HttpsError("invalid-argument", "Arquivo não é um certificado PFX/P12 válido.");
+      if (msg.includes("Invalid password") || msg.includes("PKCS#12 MAC could not be verified")) {
+        throw new functions.https.HttpsError("invalid-argument", "Senha do certificado incorreta.");
+      }
+      if (msg.includes("Too few bytes") || msg.includes("ASN.1") || msg.includes("Invalid PFX")) {
+        throw new functions.https.HttpsError("invalid-argument", "Arquivo não é um certificado PFX/P12 válido.");
+      }
       throw new functions.https.HttpsError("invalid-argument", `Certificado inválido: ${msg}`);
     }
 
     _certCache = null;
-    await db.collection("config").doc("sefaz_cert").set({ pfx_base64: pfxBase64, password, uploadedAt: new Date().toISOString(), uploadedBy: context.auth.uid });
+    await db.collection("config").doc("sefaz_cert").set({
+      pfx_base64: pfxBase64,
+      password,
+      uploadedAt: new Date().toISOString(),
+      uploadedBy: context.auth.uid,
+    });
     return { success: true, msg: "✅ Certificado A1 validado e salvo com sucesso!" };
   });
 
@@ -685,9 +771,22 @@ exports.statusSefaz = functions
     const certDoc = await db.collection("config").doc("sefaz_cert").get();
     const syncDoc = await db.collection("config").doc("sefaz_sync").get();
 
+    // Tentar extrair info do certificado
+    let certInfo = null;
+    if (certDoc.exists && certDoc.data().pfx_base64) {
+      try {
+        const pfxBuffer = Buffer.from(certDoc.data().pfx_base64, "base64");
+        const pem = pfxToPem(pfxBuffer, certDoc.data().password);
+        certInfo = { cn: pem.cn, expiraEm: pem.expiraEm, expirado: pem.expirado };
+      } catch (e) {
+        certInfo = { erro: e.message };
+      }
+    }
+
     return {
       certificadoConfigurado: certDoc.exists && !!certDoc.data().pfx_base64,
       certificadoUploadedAt: certDoc.exists ? certDoc.data().uploadedAt : null,
+      certificadoInfo: certInfo,
       ultimaSincronizacao: syncDoc.exists ? syncDoc.data().ultimaSincronizacao : null,
       ultNSU: syncDoc.exists ? syncDoc.data().ultNSU : "0",
       totalDocsSincronizados: syncDoc.exists ? syncDoc.data().totalDocsSincronizados : 0,
@@ -709,7 +808,6 @@ const ML_CONFIG = {
   API_BASE: "https://api.mercadolibre.com",
 };
 
-// ── mlGetAuthUrl: retorna URL de autorização + code_verifier (PKCE) ──
 exports.mlGetAuthUrl = functions
   .runWith({ timeoutSeconds: 10, memory: "128MB" })
   .https.onCall(async (data, context) => {
@@ -721,7 +819,6 @@ exports.mlGetAuthUrl = functions
     return { url, code_verifier: codeVerifier };
   });
 
-// ── mlExchangeToken: troca code + code_verifier por token (chamado pelo frontend) ──
 exports.mlExchangeToken = functions
   .runWith({ timeoutSeconds: 30, memory: "256MB" })
   .https.onCall(async (data, context) => {
@@ -745,7 +842,6 @@ exports.mlExchangeToken = functions
       });
 
       const tokenData = await response.json();
-
       if (tokenData.error) {
         console.error("[mlExchangeToken] Erro ML:", tokenData);
         throw new functions.https.HttpsError("unknown", `ML: ${tokenData.error} - ${tokenData.message}`);
@@ -771,7 +867,6 @@ exports.mlExchangeToken = functions
     }
   });
 
-// ── mlCallback: apenas redireciona de volta pro app com o code na URL ──
 exports.mlCallback = functions
   .runWith({ timeoutSeconds: 10, memory: "128MB" })
   .https.onRequest(async (req, res) => {
@@ -779,7 +874,6 @@ exports.mlCallback = functions
     res.redirect(`https://mbdj-financeiro.web.app/?ml_code=${encodeURIComponent(code)}`);
   });
 
-// ── Função interna: obter access_token válido (com refresh automático) ──
 async function getMLToken() {
   const doc = await db.collection("config").doc("ml_tokens").get();
   if (!doc.exists) throw new Error("ML não conectado. Faça a autorização primeiro.");
@@ -787,12 +881,10 @@ async function getMLToken() {
   const data = doc.data();
   const expiraEm = new Date(data.expira_em);
 
-  // Se ainda válido (com 5min de margem), retorna direto
   if (expiraEm > new Date(Date.now() + 300000)) {
     return data.access_token;
   }
 
-  // Refresh
   console.log("[ML] Token expirado, renovando...");
   const fetch = (await import("node-fetch")).default;
   const response = await fetch(ML_CONFIG.TOKEN_URL, {
@@ -824,7 +916,6 @@ async function getMLToken() {
   return tokenData.access_token;
 }
 
-// ── Função interna: chamada genérica à API do ML ──
 async function mlApiGet(endpoint) {
   const token = await getMLToken();
   const fetch = (await import("node-fetch")).default;
@@ -839,7 +930,6 @@ async function mlApiGet(endpoint) {
   return response.json();
 }
 
-// ── mlSincronizarEstoque: consulta estoque Full de todos os itens ──
 exports.mlSincronizarEstoque = functions
   .runWith({ timeoutSeconds: 120, memory: "512MB" })
   .https.onCall(async (data, context) => {
@@ -850,7 +940,6 @@ exports.mlSincronizarEstoque = functions
       const tokenDoc = await db.collection("config").doc("ml_tokens").get();
       const sellerId = tokenDoc.data().user_id;
 
-      // 1. Buscar todos os itens do seller
       let allItems = [];
       let offset = 0;
       let hasMore = true;
@@ -865,9 +954,8 @@ exports.mlSincronizarEstoque = functions
 
       console.log(`[mlEstoque] ${allItems.length} itens encontrados`);
 
-      // 2. Para cada item, buscar detalhes e estoque
       const produtos = [];
-      const batchSize = 20; // API aceita multiget de até 20
+      const batchSize = 20;
 
       for (let i = 0; i < allItems.length; i += batchSize) {
         const batch = allItems.slice(i, i + batchSize);
@@ -878,24 +966,17 @@ exports.mlSincronizarEstoque = functions
           if (wrapper.code !== 200 || !wrapper.body) continue;
           const item = wrapper.body;
 
-          // Helper: extrair SKU de um item/variação com múltiplos fallbacks
           function extractSku(obj, item) {
-            // 1. seller_custom_field do objeto
             if (obj.seller_custom_field) return obj.seller_custom_field;
-            // 2. Atributo SELLER_SKU nas attributes
             if (obj.attributes) {
               const skuAttr = obj.attributes.find(a => a.id === "SELLER_SKU");
               if (skuAttr && skuAttr.value_name) return skuAttr.value_name;
             }
-            // 3. seller_custom_field do item pai
             if (item && item.seller_custom_field) return item.seller_custom_field;
-            // 4. inventory_id como fallback
             if (obj.inventory_id) return obj.inventory_id;
-            // 5. Último recurso: item_id + variation_id
             return item.id + (obj.id ? "_" + obj.id : "");
           }
 
-          // Item sem variação
           if (!item.variations || item.variations.length === 0) {
             const invId = item.inventory_id;
             let stockData = null;
@@ -904,18 +985,12 @@ exports.mlSincronizarEstoque = functions
             }
             const aptas = stockData ? (stockData.available_quantity || 0) : (item.available_quantity || 0);
             produtos.push({
-              item_id: item.id,
-              titulo: item.title,
-              sku: extractSku(item, item),
-              preco: item.price,
-              status: item.status,
-              inventory_id: invId || "",
+              item_id: item.id, titulo: item.title, sku: extractSku(item, item),
+              preco: item.price, status: item.status, inventory_id: invId || "",
               available_quantity: item.available_quantity || 0,
-              full_aptas: aptas,
-              full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
+              full_aptas: aptas, full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
             });
           } else {
-            // Item com variações
             for (const v of item.variations) {
               const invId = v.inventory_id;
               let stockData = null;
@@ -924,16 +999,10 @@ exports.mlSincronizarEstoque = functions
               }
               const aptas = stockData ? (stockData.available_quantity || 0) : (v.available_quantity || 0);
               produtos.push({
-                item_id: item.id,
-                variation_id: v.id,
-                titulo: item.title,
-                sku: extractSku(v, item),
-                preco: item.price,
-                status: item.status,
-                inventory_id: invId || "",
+                item_id: item.id, variation_id: v.id, titulo: item.title, sku: extractSku(v, item),
+                preco: item.price, status: item.status, inventory_id: invId || "",
                 available_quantity: v.available_quantity || 0,
-                full_aptas: aptas,
-                full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
+                full_aptas: aptas, full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
               });
               await sleep(100);
             }
@@ -942,20 +1011,15 @@ exports.mlSincronizarEstoque = functions
         await sleep(300);
       }
 
-      // 3. Filtrar apenas com estoque > 0
       const ativos = produtos.filter(p => p.full_aptas > 0 || p.available_quantity > 0);
 
-      // Log detalhado de SKUs
       console.log(`[mlEstoque] SKUs ativos: ${ativos.map(p => p.sku + '(' + p.full_aptas + ')').join(', ')}`);
       const semSku = produtos.filter(p => !p.sku || p.sku === "");
       if (semSku.length > 0) console.log(`[mlEstoque] AVISO: ${semSku.length} itens sem SKU`);
 
-      // 4. Salvar snapshot no Firestore
       await db.collection("config").doc("ml_estoque_sync").set({
         ultima_sincronizacao: new Date().toISOString(),
-        total_itens: allItems.length,
-        total_skus: produtos.length,
-        total_ativos: ativos.length,
+        total_itens: allItems.length, total_skus: produtos.length, total_ativos: ativos.length,
         duracao_seg: ((Date.now() - startTime) / 1000).toFixed(1),
       });
 
@@ -963,12 +1027,8 @@ exports.mlSincronizarEstoque = functions
       console.log(`[mlEstoque] Concluído em ${duracao}s: ${ativos.length} SKUs ativos de ${produtos.length} total`);
 
       return {
-        success: true,
-        total_itens: allItems.length,
-        total_skus: produtos.length,
-        total_ativos: ativos.length,
-        produtos: ativos,
-        duracao: duracao,
+        success: true, total_itens: allItems.length, total_skus: produtos.length,
+        total_ativos: ativos.length, produtos: ativos, duracao: duracao,
       };
     } catch (err) {
       console.error("[mlEstoque] Erro:", err);
@@ -976,7 +1036,6 @@ exports.mlSincronizarEstoque = functions
     }
   });
 
-// ── mlStatus: verifica status da conexão ML ──
 exports.mlStatus = functions
   .runWith({ timeoutSeconds: 10, memory: "128MB" })
   .https.onCall(async (data, context) => {
@@ -998,16 +1057,32 @@ exports.mlStatus = functions
     const lastSync = syncDoc.exists ? syncDoc.data() : null;
 
     return {
-      connected: true,
-      user_id: d.user_id,
-      user_name: userName,
-      token_expira: d.expira_em,
-      token_expirado: expirado,
+      connected: true, user_id: d.user_id, user_name: userName,
+      token_expira: d.expira_em, token_expirado: expirado,
       ultima_sincronizacao: lastSync ? lastSync.ultima_sincronizacao : null,
       total_skus_sync: lastSync ? lastSync.total_ativos : 0,
     };
   });
 
-// ── mlWebhook: recebe notificações do ML (vendas, estoque) ──
 exports.mlWebhook = functions
-  .runWith({ timeoutSeco
+  .runWith({ timeoutSeconds: 30, memory: "256MB" })
+  .https.onRequest(async (req, res) => {
+    if (req.method !== "POST") { res.status(200).send("OK"); return; }
+    try {
+      const notification = req.body;
+      console.log("[mlWebhook] Notificação:", JSON.stringify(notification));
+      await db.collection("ml_notifications").add({
+        ...notification, received_at: new Date().toISOString(), processed: false,
+      });
+      res.status(200).send("OK");
+    } catch (err) {
+      console.error("[mlWebhook] Erro:", err);
+      res.status(200).send("OK");
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
