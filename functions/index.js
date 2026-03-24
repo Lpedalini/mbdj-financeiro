@@ -1141,8 +1141,14 @@ exports.mpSincronizar = functions
       // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (próximos 35 dias) ──
       const hoje = new Date();
       const hojeStr = hoje.toISOString().split("T")[0];
+      const ontem = new Date(hoje);
+      ontem.setDate(ontem.getDate() - 1);
       const ate35 = new Date(hoje);
       ate35.setDate(ate35.getDate() + 35);
+      const beginDate = ontem.toISOString().split(".")[0] + ".000-03:00";
+      const endDate = ate35.toISOString().split(".")[0] + ".000-03:00";
+
+      console.log(`[mpSync v2] Buscando payments de ${beginDate} até ${endDate}`);
 
       let allPayments = [];
       let offset = 0;
@@ -1152,8 +1158,8 @@ exports.mpSincronizar = functions
         const url = `https://api.mercadopago.com/v1/payments/search?` +
           `sort=money_release_date&criteria=asc` +
           `&range=money_release_date` +
-          `&begin_date=NOW-1DAYS` +
-          `&end_date=NOW+35DAYS` +
+          `&begin_date=${encodeURIComponent(beginDate)}` +
+          `&end_date=${encodeURIComponent(endDate)}` +
           `&status=approved` +
           `&offset=${offset}&limit=50`;
 
