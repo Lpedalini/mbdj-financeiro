@@ -1135,8 +1135,9 @@ function renderContasReceber() {
     '<div><label>Plano de Contas:</label><select id="cr-plano"><option value="">Todos</option>'+planosOpts+'</select></div>'+
     '<div><label>Centro de Custo:</label><select id="cr-centro"><option value="">Todos</option>'+centrosOpts+'</select></div></div>'+
     '<div style="display:flex;gap:8px;"><button class="btn-secondary" onclick="limparFiltrosCR()">Limpar</button><button class="btn-primary" onclick="pesquisarCR()">Pesquisar</button></div></div>'+
-    '<div id="cr-results"></div>';
+    '<div id="mp-panel"></div><div id="cr-results"></div>';
   pesquisarCR();
+  carregarPainelMP();
 }
 
 function pesquisarCR() {
@@ -1186,6 +1187,8 @@ function pesquisarCR() {
     '<button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="showImportCR()">📥 IMPORTAR CSV</button>'+
     '<button style="background:#17a2b8;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="exportarCR()">📤 EXPORTAR EXCEL</button>'+
     '<button style="background:#6c757d;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="downloadModeloCR()">📄 MODELO</button>'+
+    '<span style="color:#999;font-size:11px;">|</span>'+
+    '<button id="btn-sync-mp" style="background:#009EE3;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;" onclick="sincronizarMP()">💳 SINCRONIZAR MP</button>'+
   '</div><div class="right">'+items.length+' itens</div></div>';
 }
 
@@ -6204,6 +6207,237 @@ async function uploadCertificadoSefaz() {
     console.error('Erro upload certificado:', e);
     showToast('❌ Erro ao salvar certificado: ' + (e.message || 'Erro desconhecido'), true);
   }
+}
+
+// ============================================================
+// === MERCADO PAGO — SINCRONIZAÇÃO ===========================
+// ============================================================
+
+function sincronizarMP() {
+  var btn = document.getElementById('btn-sync-mp');
+  if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
+  showToast('⏳ Conectando ao Mercado Pago... Pode levar até 2 minutos.');
+
+  var fn = firebase.functions().httpsCallable('mpSincronizar');
+  fn({}).then(function(result) {
+    if(btn) { btn.disabled = false; btn.textContent = '💳 SINCRONIZAR MP'; }
+    var r = result.data;
+    if(!r.success) {
+      showToast('❌ Erro: ' + (r.error || 'Erro desconhecido'), true);
+      return;
+    }
+
+    // Atualizar saldo da conta Mercado Pago nas contas bancárias
+    var contas = getData('contas_bancarias');
+    var mpIdx = contas.findIndex(function(c) { return c.nome === 'Mercado Pago' || c.banco === 'Mercado Pago'; });
+    if(mpIdx >= 0) {
+      contas[mpIdx].saldoInicial = formatCurrency(r.balance.available || 0);
+      contas[mpIdx]._mpUnavailable = r.balance.unavailable || 0;
+      contas[mpIdx]._mpTotal = r.balance.total || 0;
+      contas[mpIdx]._mpSyncAt = new Date().toISOString();
+      setData('contas_bancarias', contas);
+    }
+
+    // Gerar/atualizar títulos no Contas a Receber para liberações futuras
+    if(r.calendario_futuro && r.calendario_futuro.length > 0) {
+      var crItems = getData('contas_receber');
+      var novos = 0;
+
+      r.calendario_futuro.forEach(function(dia) {
+        var jaExiste = crItems.some(function(cr) {
+          return cr._origemMP === true && cr.vencimento === dia.data;
+        });
+
+        if(!jaExiste && dia.total > 0) {
+          crItems.push({
+            numero: 'MP-' + dia.data.replace(/-/g, ''),
+            competencia: dia.data,
+            emissao: new Date().toISOString().split('T')[0],
+            vencimento: dia.data,
+            valor: formatCurrency(dia.total),
+            valorLiquido: formatCurrency(dia.total),
+            cliente: 'Mercado Pago',
+            planoContas: 'Receita Vendas',
+            centroCusto: 'BELLE DEJU',
+            conta: 'Mercado Pago',
+            empresa: 'BELLE DEJU',
+            documento: 'Previsão',
+            meioPagamento: 'Mercado Pago',
+            historico: 'Liberação MP: ' + (dia.qtd||dia.qtd_lancamentos||0) + ' lançamento(s) — bruto ' + formatCurrency(dia.bruto||0) + ' / taxas ' + formatCurrency(dia.taxas||0),
+            status: 'Aberto',
+            parcela: '1/1',
+            liquidacao: '',
+            _origemMP: true,
+            _mpBruto: dia.bruto||0,
+            _mpTaxas: dia.taxas||0,
+            _mpQtd: dia.qtd||dia.qtd_lancamentos||0
+          });
+          novos++;
+        } else if(jaExiste) {
+          var idx = crItems.findIndex(function(cr) { return cr._origemMP === true && cr.vencimento === dia.data; });
+          if(idx >= 0 && crItems[idx].status === 'Aberto') {
+            crItems[idx].valor = formatCurrency(dia.total);
+            crItems[idx].valorLiquido = formatCurrency(dia.total);
+            crItems[idx].historico = 'Liberação MP: ' + (dia.qtd||dia.qtd_lancamentos||0) + ' lançamento(s) — bruto ' + formatCurrency(dia.bruto||0) + ' / taxas ' + formatCurrency(dia.taxas||0);
+            crItems[idx]._mpBruto = dia.bruto||0;
+            crItems[idx]._mpTaxas = dia.taxas||0;
+            crItems[idx]._mpQtd = dia.qtd||dia.qtd_lancamentos||0;
+          }
+        }
+      });
+
+      if(novos > 0 || r.calendario_futuro.length > 0) {
+        setData('contas_receber', crItems);
+      }
+    }
+
+    window._mpLastSync = r;
+    renderPainelMP(r);
+    pesquisarCR();
+
+    var msg = '✅ MP sincronizado em ' + r.duracao + 's! ';
+    msg += 'Saldo: ' + formatCurrency(r.balance.available) + ' disponível';
+    if(r.resumo.total_a_receber > 0) msg += ' · A receber: ' + formatCurrency(r.resumo.total_a_receber);
+    showToast(msg);
+
+  }).catch(function(err) {
+    if(btn) { btn.disabled = false; btn.textContent = '💳 SINCRONIZAR MP'; }
+    showToast('❌ Erro MP: ' + err.message, true);
+    console.error('mpSincronizar erro:', err);
+  });
+}
+
+function carregarPainelMP() {
+  if(!currentUser) return;
+  db.collection("config").doc("mp_sync").get().then(function(doc) {
+    if(!doc.exists) return;
+    var d = doc.data();
+    db.collection("config").doc("mp_calendario").get().then(function(calDoc) {
+      var calendario = [];
+      if(calDoc.exists && calDoc.data().calendario) {
+        try { calendario = JSON.parse(calDoc.data().calendario); } catch(e) {}
+      }
+      var hojeStr = getToday();
+      var calFuturo = calendario.filter(function(c) { return c.data >= hojeStr; });
+      var calPassado = calendario.filter(function(c) { return c.data < hojeStr; });
+
+      var syncData = {
+        balance: d.balance || { available: 0, unavailable: 0, total: 0 },
+        resumo: {
+          total_a_receber: d.total_a_receber || 0,
+          total_a_pagar: d.total_a_pagar || 0,
+          saldo_projetado: (d.balance ? d.balance.available : 0) + (d.total_a_receber || 0) - (d.total_a_pagar || 0),
+          total_pedidos: d.total_pedidos || 0,
+          total_pagamentos: d.total_pagamentos || 0,
+        },
+        calendario_futuro: calFuturo,
+        calendario_passado_resumo: { dias: calPassado.length, total: calPassado.reduce(function(s, c) { return s + c.total; }, 0) },
+        _ultima_sync: d.ultima_sincronizacao || '',
+      };
+      window._mpLastSync = syncData;
+      renderPainelMP(syncData);
+    });
+  }).catch(function(e) { console.log('MP sync data não encontrado:', e.message); });
+}
+
+function renderPainelMP(data) {
+  var panel = document.getElementById('mp-panel');
+  if(!panel) return;
+  if(!data || !data.balance) { panel.innerHTML = ''; return; }
+
+  var b = data.balance;
+  var r = data.resumo || {};
+  var cal = data.calendario_futuro || [];
+  var lastSync = data._ultima_sync || '';
+  var lastSyncLabel = lastSync ? formatDateBR(lastSync.substring(0, 10)) + ' ' + lastSync.substring(11, 16) : 'Nunca';
+
+  var html = '<div style="background:white;border:1px solid #009EE3;border-radius:10px;overflow:hidden;margin-bottom:16px;">';
+  html += '<div style="background:#009EE3;color:white;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;">';
+  html += '<div style="display:flex;align-items:center;gap:8px;"><span style="font-size:18px;">💳</span><strong style="font-size:14px;">Mercado Pago — Lançamentos Futuros</strong></div>';
+  html += '<div style="font-size:11px;opacity:0.8;">Última sync: ' + lastSyncLabel + '</div>';
+  html += '</div>';
+
+  html += '<div style="padding:14px;">';
+
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">';
+  html += '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#166534;font-weight:600;text-transform:uppercase;">Disponível</div><div style="font-size:20px;font-weight:800;color:#16a34a;">' + formatCurrency(b.available) + '</div></div>';
+  html += '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#1e40af;font-weight:600;text-transform:uppercase;">A Liberar</div><div style="font-size:20px;font-weight:800;color:#2563eb;">' + formatCurrency(b.unavailable) + '</div></div>';
+  html += '<div style="background:#fefce8;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#854d0e;font-weight:600;text-transform:uppercase;">Total Conta</div><div style="font-size:20px;font-weight:800;color:#ca8a04;">' + formatCurrency(b.total) + '</div></div>';
+  if(r.total_a_receber > 0) {
+    html += '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#0c4a6e;font-weight:600;text-transform:uppercase;">A Receber 30d</div><div style="font-size:20px;font-weight:800;color:#0284c7;">' + formatCurrency(r.total_a_receber) + '</div></div>';
+  }
+  html += '</div>';
+
+  if(cal.length > 0) {
+    var totalCal = cal.reduce(function(s, d) { return s + d.total; }, 0);
+    html += '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">';
+    html += '<div style="background:#f9fafb;padding:8px 14px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center;">';
+    html += '<strong style="font-size:12px;color:#374151;">📅 Calendário de Lançamentos</strong>';
+    html += '<span style="font-size:12px;font-weight:700;color:#009EE3;">Total: ' + formatCurrency(totalCal) + ' em ' + cal.length + ' dia(s)</span>';
+    html += '</div>';
+
+    html += '<div style="max-height:300px;overflow-y:auto;">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<thead><tr style="background:#f3f4f6;position:sticky;top:0;">';
+    html += '<th style="padding:7px 12px;text-align:left;font-size:10px;color:#6b7280;width:30px;"></th>';
+    html += '<th style="padding:7px 12px;text-align:left;font-size:10px;color:#6b7280;">Data</th>';
+    html += '<th style="padding:7px 12px;text-align:right;font-size:10px;color:#6b7280;">Bruto</th>';
+    html += '<th style="padding:7px 12px;text-align:right;font-size:10px;color:#6b7280;">Taxas</th>';
+    html += '<th style="padding:7px 12px;text-align:right;font-size:10px;color:#6b7280;">Líquido</th>';
+    html += '<th style="padding:7px 12px;text-align:center;font-size:10px;color:#6b7280;">Lançam.</th>';
+    html += '</tr></thead><tbody>';
+
+    cal.forEach(function(dia, idx) {
+      var isHoje = dia.data === getToday();
+      var bg = isHoje ? '#eff6ff' : (idx % 2 === 0 ? '#fff' : '#f9fafb');
+      var liquido = dia.total || 0;
+      var bruto = dia.bruto || 0;
+      var taxas = dia.taxas || 0;
+      var qtd = dia.qtd || dia.qtd_lancamentos || 0;
+
+      html += '<tr style="background:' + bg + ';border-bottom:1px solid #f3f4f6;cursor:pointer;" onclick="toggleMPDay(\'mp-day-' + idx + '\',this)">';
+      html += '<td style="padding:6px 12px;text-align:center;"><span class="fc-expand" style="font-size:10px;color:#9ca3af;">▶</span></td>';
+      html += '<td style="padding:6px 12px;font-weight:600;' + (isHoje ? 'color:#2563eb;' : '') + '">' + formatDateBR(dia.data) + (isHoje ? ' (HOJE)' : '') + '</td>';
+      html += '<td style="padding:6px 12px;text-align:right;color:#6b7280;">' + formatCurrency(bruto) + '</td>';
+      html += '<td style="padding:6px 12px;text-align:right;color:#ef4444;font-size:11px;">-' + formatCurrency(taxas) + '</td>';
+      html += '<td style="padding:6px 12px;text-align:right;font-weight:700;color:#16a34a;">+' + formatCurrency(liquido) + '</td>';
+      html += '<td style="padding:6px 12px;text-align:center;font-size:11px;color:#6b7280;">' + qtd + '</td>';
+      html += '</tr>';
+
+      html += '<tr id="mp-day-' + idx + '" style="display:none;"><td colspan="6" style="padding:8px 20px;background:#f8fafc;">';
+      if(dia.lancamentos && dia.lancamentos.length > 0) {
+        html += '<table style="width:100%;font-size:11px;border-collapse:collapse;">';
+        html += '<thead><tr style="background:#e5e7eb;"><th style="padding:4px 8px;text-align:left;">Descrição</th><th style="padding:4px 8px;text-align:left;">Hora</th><th style="padding:4px 8px;text-align:right;">Bruto</th><th style="padding:4px 8px;text-align:right;">Taxas</th><th style="padding:4px 8px;text-align:right;">Líquido</th></tr></thead><tbody>';
+        dia.lancamentos.forEach(function(l) {
+          html += '<tr style="border-bottom:1px solid #f3f4f6;">';
+          html += '<td style="padding:3px 8px;">' + (l.descricao || 'Liberação') + '</td>';
+          html += '<td style="padding:3px 8px;color:#888;">' + (l.hora || '') + '</td>';
+          html += '<td style="padding:3px 8px;text-align:right;">' + formatCurrency(l.bruto || 0) + '</td>';
+          html += '<td style="padding:3px 8px;text-align:right;color:#ef4444;">-' + formatCurrency(l.taxas || 0) + '</td>';
+          html += '<td style="padding:3px 8px;text-align:right;font-weight:600;color:#16a34a;">+' + formatCurrency(l.liquido || 0) + '</td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+      } else {
+        html += '<span style="color:#888;font-size:11px;">Sem detalhes disponíveis.</span>';
+      }
+      html += '</td></tr>';
+    });
+
+    html += '</tbody></table></div></div>';
+  } else {
+    html += '<div style="text-align:center;padding:16px;color:#888;font-size:13px;">Clique em <strong>💳 SINCRONIZAR MP</strong> para carregar o calendário de lançamentos.</div>';
+  }
+
+  html += '</div></div>';
+  panel.innerHTML = html;
+}
+
+function toggleMPDay(id, row) {
+  var d = document.getElementById(id);
+  var a = row ? row.querySelector('.fc-expand') : null;
+  if(d.style.display === 'none') { d.style.display = ''; if(a) a.textContent = '▼'; }
+  else { d.style.display = 'none'; if(a) a.textContent = '▶'; }
 }
 
 // ============================================================
