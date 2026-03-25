@@ -5347,6 +5347,8 @@ function sincronizarEstoqueML() {
 
       var skus = getSkus();
       var movs = getMov();
+      // Limpar movimentações de syncs anteriores do ML (evita acúmulo)
+      movs = movs.filter(function(m) { return m._fonte !== 'ml_api'; });
       var novos = 0, atualizados = 0;
       var hoje = getToday();
 
