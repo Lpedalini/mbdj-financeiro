@@ -1145,18 +1145,20 @@ exports.mpSincronizar = functions
         }
       }
 
-      // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (D0 a D+35) ──
-      // Começa hoje (horário Brasil). Filtro de money_release_status=released descarta o que já caiu.
+      // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (AGORA a D+35) ──
+      // begin_date = agora (não meia-noite). Liberações anteriores à hora atual já estão no saldo.
+      // Ex: sync às 9:48 → pega 10h, 11h, ..., 21h de hoje + dias futuros
       const hoje = new Date();
-      // Ajustar para horário Brasil (UTC-3)
+      // Horário Brasil (UTC-3)
       const brNow = new Date(hoje.getTime() - 3 * 60 * 60 * 1000);
       const hojeStr = brNow.toISOString().split("T")[0];
+      const brHora = brNow.toISOString().split("T")[1].substring(0, 8); // HH:MM:SS
       const ate35 = new Date(brNow);
       ate35.setDate(ate35.getDate() + 35);
-      const beginDate = hojeStr + "T00:00:00.000-03:00";
+      const beginDate = hojeStr + "T" + brHora + ".000-03:00";
       const endDate = ate35.toISOString().split("T")[0] + "T23:59:59.000-03:00";
 
-      console.log(`[mpSync v2] Buscando payments de ${beginDate} até ${endDate} (D0 BR a D+35)`);
+      console.log(`[mpSync v2] Buscando payments de ${beginDate} até ${endDate} (AGORA BR a D+35)`);
 
       let allPayments = [];
       let offset = 0;
