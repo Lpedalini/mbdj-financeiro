@@ -4950,21 +4950,23 @@ function _renderTabelaEstoque(posicao) {
     else if(dias < 999) alertBadge = '<span style="background:#17a2b8;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">📦 '+dias+'d</span>';
     else alertBadge = '<span style="color:#ccc;font-size:10px;">—</span>';
 
-    var velStr = vel > 0 ? vel.toFixed(1)+'/dia' : '—';
+    var velStr = vel > 0 ? vel.toFixed(1)+'/d' : '—';
+    var naoAptas = parseInt(sku.full_nao_aptas) || 0;
+    var totalFull = parseInt(sku.full_total) || fullAptas;
     var qtdC = fullAptas<=0?'#e74c3c':(dias<=7?'#e74c3c':(dias<=21?'#f39c12':'#27ae60'));
 
     return '<tr style="border-bottom:1px solid #f0f0f0;">'+
       '<td style="padding:7px 10px;font-weight:700;font-size:12px;color:#1a5276;">'+sku.sku+'</td>'+
-      '<td style="padding:7px 10px;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+sku.descricao+'</td>'+
-      '<td style="padding:7px 10px;text-align:center;font-weight:700;font-size:15px;color:'+qtdC+';">'+fullAptas.toLocaleString('pt-BR')+'</td>'+
-      '<td style="padding:7px 10px;text-align:center;font-size:12px;color:#f39c12;font-weight:'+(aCaminho>0?'700':'400')+';">'+(aCaminho>0?'+'+aCaminho:'—')+'</td>'+
+      '<td style="padding:7px 10px;font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+sku.descricao+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-weight:700;font-size:14px;color:'+qtdC+';">'+fullAptas.toLocaleString('pt-BR')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-size:12px;color:'+(naoAptas>0?'#dc3545':'#ccc')+';">'+(naoAptas>0?naoAptas:'—')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-size:12px;color:'+(aCaminho>0?'#f39c12':'#ccc')+';">'+(aCaminho>0?aCaminho:'—')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-weight:600;font-size:12px;">'+totalFull.toLocaleString('pt-BR')+'</td>'+
       '<td style="padding:7px 10px;text-align:center;font-size:11px;color:#0d6efd;">'+velStr+'</td>'+
       '<td style="padding:7px 10px;text-align:center;">'+alertBadge+'</td>'+
       '<td style="padding:7px 10px;text-align:right;font-size:11px;">'+formatCurrency(custoMed)+'</td>'+
       '<td style="padding:7px 10px;text-align:right;font-weight:700;font-size:11px;color:#1a5276;">'+formatCurrency(custoTot)+'</td>'+
       '<td style="padding:7px 10px;white-space:nowrap;">'+
-        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'entrada\')" style="background:#27ae60;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Entrada">▲</button> '+
-        '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'saida\')" style="background:#e74c3c;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Saída">▼</button> '+
         '<button onclick="editarSku(\''+sku.id+'\')" style="background:#f39c12;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Editar">✏️</button> '+
         '<button onclick="excluirSku(\''+sku.id+'\')" style="background:#e0e0e0;color:#555;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Excluir">🗑️</button>'+
       '</td>'+
@@ -4977,17 +4979,19 @@ function _renderTabelaEstoque(posicao) {
         '<thead><tr style="background:#1a5276;color:#fff;">'+
           '<th style="padding:9px 10px;text-align:left;font-size:11px;">SKU</th>'+
           '<th style="padding:9px 10px;text-align:left;font-size:11px;">Descrição</th>'+
-          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Full</th>'+
-          '<th style="padding:9px 10px;text-align:center;font-size:11px;">A caminho</th>'+
-          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Velocidade</th>'+
-          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Esgotar em</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;background:#1a6b3c;">Aptas</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;background:#8b4513;">Não Aptas</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;background:#b8860b;">A Caminho</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Total Full</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Vel.</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Esgotar</th>'+
           '<th style="padding:9px 10px;text-align:right;font-size:11px;">Custo Méd.</th>'+
           '<th style="padding:9px 10px;text-align:right;font-size:11px;">Custo Total</th>'+
-          '<th style="padding:9px 10px;text-align:center;font-size:11px;">A\u{00E7}ões</th>'+
+          '<th style="padding:9px 10px;text-align:center;font-size:11px;">Ações</th>'+
         '</tr></thead>'+
         '<tbody>'+rows+'</tbody>'+
         '<tfoot><tr style="background:#f0f4f8;font-weight:700;">'+
-          '<td colspan="7" style="padding:8px 10px;text-align:right;font-size:12px;">Total Filtrado:</td>'+
+          '<td colspan="9" style="padding:8px 10px;text-align:right;font-size:12px;">Total Filtrado:</td>'+
           '<td style="padding:8px 10px;text-align:right;font-size:13px;color:#1a5276;">'+formatCurrency(totalF)+'</td>'+
           '<td></td>'+
         '</tr></tfoot>'+
@@ -5380,6 +5384,8 @@ function sincronizarEstoqueML() {
           skus[idx].full_transferencia = p.full_transferencia || 0;
           skus[idx].full_entrada = p.full_entrada || 0;
           skus[idx].full_nao_aptas = p.full_nao_aptas || 0;
+          skus[idx].full_extraviadas = p.full_extraviadas || 0;
+          skus[idx].full_em_revisao = p.full_em_revisao || 0;
           skus[idx].full_total = p.full_total || 0;
           skus[idx].preco_ml = p.preco;
           skus[idx].ml_atualizado_em = hoje;
@@ -5388,7 +5394,7 @@ function sincronizarEstoqueML() {
             id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
             data: hoje, qtd: qtdTotal,
             custo_unitario: skus[idx].custo_medio || 'R$ 0,00',
-            nfe: '', historico: 'Sync ML: aptas='+p.full_aptas+' transf='+(p.full_transferencia||0)+' entrada='+(p.full_entrada||0)+' | '+p.titulo.substring(0,35),
+            nfe: '', historico: 'Sync ML: aptas='+p.full_aptas+' naoAptas='+(p.full_nao_aptas||0)+' transf='+(p.full_transferencia||0)+' total='+(p.full_total||0),
             _fonte: 'ml_api'
           });
           atualizados++;
@@ -5402,6 +5408,7 @@ function sincronizarEstoqueML() {
             ml_item_id: p.item_id, ml_inventory_id: p.inventory_id,
             full_aptas: p.full_aptas || 0, full_transferencia: p.full_transferencia || 0,
             full_entrada: p.full_entrada || 0, full_nao_aptas: p.full_nao_aptas || 0,
+            full_extraviadas: p.full_extraviadas || 0, full_em_revisao: p.full_em_revisao || 0,
             full_total: p.full_total || 0,
             preco_ml: p.preco, ml_atualizado_em: hoje, criado_em: hoje
           });
