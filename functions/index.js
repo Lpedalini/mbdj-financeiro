@@ -1115,35 +1115,7 @@ exports.mpSincronizar = functions
 
       console.log(`[mpSync v2] Iniciado para seller ${sellerId}`);
 
-      // ── 1. SALDO DA CONTA ──
-      // Tenta múltiplos endpoints pois o principal retorna 403 em algumas configs
-      let balance = { available: 0, unavailable: 0, total: 0 };
-      const balanceEndpoints = [
-        { url: `https://api.mercadopago.com/users/${sellerId}/mercadopago_account/balance`, name: "MP balance" },
-        { url: `${ML_CONFIG.API_BASE}/users/${sellerId}/mercadopago_account/balance`, name: "ML balance" },
-        { url: `https://api.mercadopago.com/v1/account/balance`, name: "MP v1 balance" },
-        { url: `${ML_CONFIG.API_BASE}/users/${sellerId}/balance`, name: "ML user balance" },
-      ];
-
-      for (const ep of balanceEndpoints) {
-        try {
-          const balRes = await fetch(ep.url, { headers: { "Authorization": `Bearer ${token}` } });
-          const text = await balRes.text();
-          console.log(`[mpSync v2] ${ep.name} (${balRes.status}): ${text.substring(0, 300)}`);
-          if (balRes.ok) {
-            const b = JSON.parse(text);
-            balance = {
-              available: b.available_balance || b.available || 0,
-              unavailable: b.unavailable_balance || b.unavailable || 0,
-              total: (b.available_balance || b.available || 0) + (b.unavailable_balance || b.unavailable || 0),
-            };
-            console.log(`[mpSync v2] Saldo OK via ${ep.name}: disponivel=${balance.available}, a liberar=${balance.unavailable}`);
-            break; // Encontrou, para de tentar
-          }
-        } catch (e) {
-          console.warn(`[mpSync v2] ${ep.name} erro: ${e.message}`);
-        }
-      }
+      // Saldo não disponível via API OAuth do ML (403). Gerenciado manualmente em Contas Bancárias.
 
       // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (AGORA a D+35) ──
       // begin_date = agora (não meia-noite). Liberações anteriores à hora atual já estão no saldo.
@@ -1279,7 +1251,6 @@ exports.mpSincronizar = functions
       // ── 5. SALVAR NO FIRESTORE ──
       await db.collection("config").doc("mp_sync").set({
         ultima_sincronizacao: new Date().toISOString(),
-        balance,
         total_a_receber: totalAReceber,
         total_pagamentos: allPayments.length,
         payments_pendentes: allPayments.length - skippedReleased - skippedNegative,
@@ -1296,21 +1267,75 @@ exports.mpSincronizar = functions
       return {
         success: true,
         duracao,
-        balance,
         resumo: {
           total_a_receber: totalAReceber,
-          total_a_pagar: 0,
-          saldo_projetado: balance.available + totalAReceber,
           total_pagamentos: allPayments.length - skippedReleased - skippedNegative,
         },
         calendario_futuro: calendarioFuturo.slice(0, 60),
-        calendario_passado_resumo: {
-          dias: calendarioPassado.length,
-          total: calendarioPassado.reduce((s, d) => s + d.total, 0),
-        },
       };
     } catch (err) {
       console.error("[mpSync v2] Erro:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  DEBUG — EXPLORAR ENDPOINTS MP/ML
+// ══════════════════════════════════════════════════════════
+exports.mpDebug = functions
+  .runWith({ timeoutSeconds: 30, memory: "256MB" })
+  .https.onCall(async (data, context) => {
+    try {
+      const token = await getMLToken();
+      const tokenDoc = await db.collection("config").doc("ml_tokens").get();
+      const sellerId = tokenDoc.data().user_id;
+      const fetch = (await import("node-fetch")).default;
+
+      const endpoints = [
+        `/users/${sellerId}`,
+        `/users/me`,
+        `/users/${sellerId}/mercadopago_account`,
+        `/users/${sellerId}/mercadopago_account/balance`,
+        `/users/${sellerId}/available_balance`,
+      ];
+
+      const mpEndpoints = [
+        `https://api.mercadopago.com/users/${sellerId}/mercadopago_account/balance`,
+        `https://api.mercadopago.com/v1/account/balance`,
+        `https://api.mercadopago.com/v1/balance`,
+        `https://api.mercadopago.com/merchant_orders/search?seller=${sellerId}&limit=1`,
+      ];
+
+      const results = [];
+
+      for (const ep of endpoints) {
+        try {
+          const url = `https://api.mercadolibre.com${ep}`;
+          const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+          const text = await res.text();
+          const preview = text.substring(0, 500);
+          console.log(`[mpDebug] ML ${ep} (${res.status}): ${preview}`);
+          results.push({ endpoint: ep, status: res.status, preview });
+        } catch (e) {
+          results.push({ endpoint: ep, error: e.message });
+        }
+      }
+
+      for (const url of mpEndpoints) {
+        try {
+          const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+          const text = await res.text();
+          const preview = text.substring(0, 500);
+          const shortUrl = url.replace("https://api.mercadopago.com", "MP");
+          console.log(`[mpDebug] ${shortUrl} (${res.status}): ${preview}`);
+          results.push({ endpoint: shortUrl, status: res.status, preview });
+        } catch (e) {
+          results.push({ endpoint: url, error: e.message });
+        }
+      }
+
+      return { success: true, results };
+    } catch (err) {
       return { success: false, error: err.message };
     }
   });
