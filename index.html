@@ -5355,6 +5355,17 @@ function sincronizarEstoqueML() {
       var movs = getMov();
       // Limpar movimentações de syncs anteriores do ML (evita acúmulo)
       movs = movs.filter(function(m) { return m._fonte !== 'ml_api'; });
+
+      // Coletar SKUs que vieram na sync
+      var skusNaSync = {};
+      r.produtos.forEach(function(p) { if(p.sku) skusNaSync[p.sku] = true; });
+
+      // Remover SKUs ML que não vieram mais (anúncios inativos ou deduplicados)
+      skus = skus.filter(function(s) {
+        if(s.localizacao === 'ML Full' && !skusNaSync[s.sku]) return false;
+        return true;
+      });
+
       var novos = 0, atualizados = 0;
       var hoje = getToday();
 
