@@ -964,6 +964,7 @@ exports.mlSincronizarEstoque = functions
       console.log(`[mlEstoque] ${allItems.length} itens ATIVOS encontrados`);
 
       const produtos = [];
+      const skusSeen = new Set(); // Deduplicar variações com mesmo SKU
       const batchSize = 20;
       let debugCount = 0;
 
@@ -994,6 +995,10 @@ exports.mlSincronizarEstoque = functions
             const isVariation = v !== item;
             const invId = isVariation ? v.inventory_id : item.inventory_id;
             const sku = extractSku(isVariation ? v : item, item);
+
+            // Pular se já processamos este SKU (variações compartilham inventory_id)
+            if (sku && skusSeen.has(sku)) continue;
+            if (sku) skusSeen.add(sku);
 
             // Buscar estoque Full
             let stockData = null;
@@ -1042,13 +1047,18 @@ exports.mlSincronizarEstoque = functions
             // Total = tudo que está no sistema Full (aptas + transferência + entrada)
             const totalFull = aptas + emTransferencia + entradaPendente;
 
-            // Só adicionar se tem qualquer estoque ou o item está ativo com SKU
+            // Deduplicar: se já vimos esse SKU, pula (variações com mesmo SKU compartilham estoque)
+            const skuKey = sku || (invId || item.id);
+            if (skusSeen.has(skuKey)) continue;
+
+            // Só adicionar se tem qualquer estoque
             if (totalFull > 0 || aptas > 0) {
+              skusSeen.add(skuKey);
               produtos.push({
                 item_id: item.id,
                 variation_id: isVariation ? v.id : null,
                 titulo: item.title,
-                sku: sku || (invId || item.id),
+                sku: skuKey,
                 preco: item.price,
                 status: item.status,
                 inventory_id: invId || "",
