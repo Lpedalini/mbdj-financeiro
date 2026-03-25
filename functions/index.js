@@ -1049,12 +1049,17 @@ exports.mlSincronizarEstoque = functions
 
             const skuKey = sku || (invId || item.id);
 
-            // Deduplicar por anúncio (item.id) — variações do mesmo anúncio = mesmo estoque
-            if (skusSeen.has(item.id)) continue;
+            // Deduplicar por inventory_id (estoque físico único no Full)
+            // Anúncio próprio + catálogo compartilham mesmo inventory_id
+            const dedupKey = invId || item.id;
+            if (skusSeen.has(dedupKey)) {
+              console.log(`[mlEstoque] DEDUP: pular ${skuKey} (invId=${invId}, item=${item.id}) — já visto`);
+              continue;
+            }
 
             // Só adicionar se tem qualquer estoque
             if (totalFull > 0 || aptas > 0) {
-              skusSeen.add(item.id);
+              skusSeen.add(dedupKey);
               produtos.push({
                 item_id: item.id,
                 variation_id: isVariation ? v.id : null,
