@@ -1047,13 +1047,15 @@ exports.mlSincronizarEstoque = functions
             // Total = tudo que está no sistema Full (aptas + transferência + entrada)
             const totalFull = aptas + emTransferencia + entradaPendente;
 
-            // Deduplicar: se já vimos esse SKU, pula (variações com mesmo SKU compartilham estoque)
             const skuKey = sku || (invId || item.id);
-            if (skusSeen.has(skuKey)) continue;
+
+            // Deduplicar: variações com mesmo inventory_id compartilham estoque
+            const dedupKey = invId || skuKey;
+            if (skusSeen.has(dedupKey)) continue;
 
             // Só adicionar se tem qualquer estoque
             if (totalFull > 0 || aptas > 0) {
-              skusSeen.add(skuKey);
+              skusSeen.add(dedupKey);
               produtos.push({
                 item_id: item.id,
                 variation_id: isVariation ? v.id : null,
