@@ -5328,19 +5328,8 @@ function verificarStatusML() {
 }
 
 function sincronizarEstoqueML() {
-  var fnStatus = firebase.functions().httpsCallable('mlStatus');
-  fnStatus({}).then(function(result) {
-    var d = result.data;
-    if(!d.connected) {
-      if(confirm('Mercado Livre não está conectado.\n\nDeseja conectar agora?')) {
-        conectarML();
-      }
-      return;
-    }
-
     var btn = document.getElementById('btn-sync-ml');
     if(btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;"><span class="spin-anim" style="display:inline-block;width:14px;height:14px;border:2px solid rgba(255,230,0,0.3);border-top:2px solid #FFE600;border-radius:50%;animation:spin 0.8s linear infinite;"></span> Sincronizando...</span>'; }
-    // Overlay na tabela
     var wrap = document.getElementById('est-tabela-wrap');
     if(wrap) { wrap.innerHTML = '<div style="padding:60px;text-align:center;background:rgba(255,255,255,0.95);border-radius:10px;border:1px solid #e0e0e0;"><div style="font-size:36px;margin-bottom:12px;animation:pulse 1.5s infinite;">🔄</div><div style="font-size:14px;font-weight:600;color:#2D3277;">Sincronizando com Mercado Livre...</div><div style="font-size:12px;color:#888;margin-top:6px;">Buscando itens ativos e estoque Full. Pode levar até 1 minuto.</div></div>'; }
     showToast('⏳ Conectando ao Mercado Livre...');
@@ -5352,6 +5341,7 @@ function sincronizarEstoqueML() {
       var r = result.data;
       if(!r.success) {
         showToast('❌ Erro: '+r.error, true);
+        renderEstoque();
         return;
       }
 
@@ -5365,7 +5355,6 @@ function sincronizarEstoqueML() {
         var idx = skus.findIndex(function(s){ return s.sku === p.sku; });
 
         if(idx >= 0) {
-          // Atualizar dados ML preservando custo e config manual
           skus[idx].ml_item_id = p.item_id;
           skus[idx].ml_inventory_id = p.inventory_id;
           skus[idx].full_aptas = p.full_aptas || 0;
@@ -5375,7 +5364,6 @@ function sincronizarEstoqueML() {
           skus[idx].full_total = p.full_total || 0;
           skus[idx].preco_ml = p.preco;
           skus[idx].ml_atualizado_em = hoje;
-          // Ajuste de estoque com quantidade = aptas + transferência
           var qtdTotal = (p.full_aptas || 0) + (p.full_transferencia || 0) + (p.full_entrada || 0);
           movs.push({
             id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
@@ -5418,10 +5406,8 @@ function sincronizarEstoqueML() {
     }).catch(function(err) {
       if(btn) { btn.disabled = false; btn.textContent = '🔗 Sincronizar ML'; }
       showToast('❌ Erro na sincronização: '+err.message, true);
+      renderEstoque();
     });
-  }).catch(function(err) {
-    showToast('❌ Erro: '+err.message, true);
-  });
 }
 
 // Detectar callback ML na URL
