@@ -2516,12 +2516,16 @@ function pesquisarFC() {
   });
   rows+='<tr style="background:#e8f5e9;font-weight:bold;"><td></td><td>Saldo Final ('+(ate?formatDateBR(ate):'')+')</td><td style="text-align:right;color:#28a745;">'+formatCurrency(tEnt)+'</td><td style="text-align:right;color:#dc3545;">'+formatCurrency(tSai)+'</td><td style="text-align:right;color:#007bff;">'+(tProj>0?formatCurrency(tProj):'')+'</td><td style="text-align:right;color:'+(saldo>=0?'#28a745':'#dc3545')+';">'+formatCurrency(saldo)+'</td></tr>';
 
-  document.getElementById('fc-results').innerHTML='<div style="overflow-x:auto;"><table class="data-table" id="fc-table"><thead><tr><th style="width:30px"></th><th>Data</th><th style="text-align:right">Entradas</th><th style="text-align:right">Saídas</th><th style="text-align:right;color:#007bff;">Projeções</th><th style="text-align:right">Saldo</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
-  '<div style="display:flex;justify-content:center;gap:15px;margin-top:15px;padding:10px;flex-wrap:wrap;">'+
-  '<div style="background:#d4edda;padding:10px 20px;border-radius:8px;text-align:center;"><div style="font-size:12px;color:#666;">Total Entradas</div><div style="font-size:18px;font-weight:bold;color:#28a745;">'+formatCurrency(tEnt)+'</div></div>'+
-  '<div style="background:#f8d7da;padding:10px 20px;border-radius:8px;text-align:center;"><div style="font-size:12px;color:#666;">Total Saídas</div><div style="font-size:18px;font-weight:bold;color:#dc3545;">'+formatCurrency(tSai)+'</div></div>'+
-  (tProj>0?'<div style="background:#e8f0fe;padding:10px 20px;border-radius:8px;text-align:center;"><div style="font-size:12px;color:#666;">Total Projeções</div><div style="font-size:18px;font-weight:bold;color:#007bff;">'+formatCurrency(tProj)+'</div></div>':'')+
-  '<div style="background:#d1ecf1;padding:10px 20px;border-radius:8px;text-align:center;"><div style="font-size:12px;color:#666;">Saldo Final'+(tProj>0?' (c/ projeções)':'')+'</div><div style="font-size:18px;font-weight:bold;color:'+(saldo>=0?'#28a745':'#dc3545')+';">'+formatCurrency(saldo)+'</div></div></div>';
+  document.getElementById('fc-results').innerHTML=
+  // Cards grandes no topo
+  '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">'+
+    '<div style="background:#e8f5e9;border:1px solid #c3e6cb;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#155724;font-weight:600;text-transform:uppercase;">💰 Saldo Inicial</div><div style="font-size:26px;font-weight:800;color:#28a745;margin-top:4px;">'+formatCurrency(saldoIni)+'</div></div>'+
+    '<div style="background:#d4edda;border:1px solid #c3e6cb;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#155724;font-weight:600;text-transform:uppercase;">📈 Entradas</div><div style="font-size:26px;font-weight:800;color:#28a745;margin-top:4px;">+ '+formatCurrency(tEnt)+'</div>'+(tProj>0?'<div style="font-size:10px;color:#007bff;margin-top:2px;">+ '+formatCurrency(tProj)+' projeções</div>':'')+'</div>'+
+    '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#721c24;font-weight:600;text-transform:uppercase;">📉 Saídas</div><div style="font-size:26px;font-weight:800;color:#dc3545;margin-top:4px;">- '+formatCurrency(tSai)+'</div></div>'+
+    '<div style="background:'+(saldo>=0?'#d1ecf1':'#f8d7da')+';border:1px solid '+(saldo>=0?'#bee5eb':'#f5c6cb')+';border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:'+(saldo>=0?'#0c5460':'#721c24')+';font-weight:600;text-transform:uppercase;">🏦 Saldo Final</div><div style="font-size:26px;font-weight:800;color:'+(saldo>=0?'#28a745':'#dc3545')+';margin-top:4px;">'+formatCurrency(saldo)+'</div></div>'+
+  '</div>'+
+  // Tabela
+  '<div style="overflow-x:auto;"><table class="data-table" id="fc-table"><thead><tr><th style="width:30px"></th><th>Data</th><th style="text-align:right">Entradas</th><th style="text-align:right">Saídas</th><th style="text-align:right;color:#007bff;">Projeções</th><th style="text-align:right">Saldo</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }
 function toggleFCDay(id,row){var d=document.getElementById(id);var a=row.querySelector('.fc-expand');if(d.style.display==='none'){d.style.display='';if(a)a.textContent='▼';}else{d.style.display='none';if(a)a.textContent='▶';}}
 
@@ -4843,8 +4847,10 @@ function renderEstoque() {
   var posicao = calcularPosicao(skus, movs);
   var totalSkus = skus.length;
   var totalPecas = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_aptas)||0); },0);
+  var totalNaoAptas = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_nao_aptas)||0); },0);
   var custoTotal = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_aptas)||0) * (parseCurrency(sk.custo_medio)||0); },0);
   var totalACaminho = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_transferencia)||parseInt(sk.full_a_caminho)||0); },0);
+  var totalFull = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_total)||0); },0);
   var totalVendas30d = skus.reduce(function(s,sk){ return s + (parseInt(sk.vendas_30d)||0); },0);
   var abaixoMinimo = posicao.filter(function(p){
     var fa = parseInt(p.sku.full_aptas)||0;
@@ -4878,16 +4884,11 @@ function renderEstoque() {
         '</select></div>'+
       '</div>'+
     '</div>'+
-    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:16px;">'+
-      '<div class="dash-card blue"><div class="label">📦 SKUs</div><div class="value" style="font-size:26px;">'+totalSkus+'</div></div>'+
-      '<div class="dash-card green"><div class="label">✅ Full (aptas)</div><div class="value" style="font-size:20px;">'+totalPecas.toLocaleString('pt-BR')+'</div></div>'+
-      '<div class="dash-card orange"><div class="label">💰 Custo Total</div><div class="value" style="font-size:18px;">'+formatCurrency(custoTotal)+'</div></div>'+
-      '<div class="dash-card" style="border-left:4px solid '+(abaixoMinimo>0?'#e74c3c':'#27ae60')+';">'+
-        '<div class="label">🚨 Alertas</div>'+
-        '<div class="value" style="font-size:26px;color:'+(abaixoMinimo>0?'#e74c3c':'#27ae60')+';">'+abaixoMinimo+'</div>'+
-      '</div>'+
-      '<div class="dash-card" style="border-left:4px solid #f39c12;"><div class="label">🚚 A caminho</div><div class="value" style="font-size:20px;color:#f39c12;">'+totalACaminho.toLocaleString('pt-BR')+'</div></div>'+
-      '<div class="dash-card" style="border-left:4px solid #0d6efd;"><div class="label">📈 Vendas 30d</div><div class="value" style="font-size:20px;color:#0d6efd;">'+totalVendas30d.toLocaleString('pt-BR')+'</div></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">'+
+      '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#166534;font-weight:600;text-transform:uppercase;">✅ Aptas para Venda</div><div style="font-size:28px;font-weight:800;color:#16a34a;margin-top:4px;">'+totalPecas.toLocaleString('pt-BR')+'</div><div style="font-size:11px;color:#888;margin-top:2px;">'+totalSkus+' SKUs · '+formatCurrency(custoTotal)+'</div></div>'+
+      '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#991b1b;font-weight:600;text-transform:uppercase;">❌ Não Aptas</div><div style="font-size:28px;font-weight:800;color:#dc2626;margin-top:4px;">'+totalNaoAptas.toLocaleString('pt-BR')+'</div><div style="font-size:11px;color:#888;margin-top:2px;">Revisão / Extraviadas</div></div>'+
+      '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#92400e;font-weight:600;text-transform:uppercase;">🚚 A Caminho</div><div style="font-size:28px;font-weight:800;color:#d97706;margin-top:4px;">'+totalACaminho.toLocaleString('pt-BR')+'</div><div style="font-size:11px;color:#888;margin-top:2px;">Em transferência</div></div>'+
+      '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:14px 18px;text-align:center;"><div style="font-size:11px;color:#1e40af;font-weight:600;text-transform:uppercase;">📦 Total Full</div><div style="font-size:28px;font-weight:800;color:#2563eb;margin-top:4px;">'+totalFull.toLocaleString('pt-BR')+'</div><div style="font-size:11px;color:#888;margin-top:2px;">Todas as unidades</div></div>'+
     '</div>'+
     '<div id="est-tabela-wrap"></div>';
 
