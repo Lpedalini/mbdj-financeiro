@@ -948,22 +948,24 @@ exports.mlSincronizarEstoque = functions
       const tokenDoc = await db.collection("config").doc("ml_tokens").get();
       const sellerId = tokenDoc.data().user_id;
 
+      // 1. Buscar apenas itens ATIVOS
       let allItems = [];
       let offset = 0;
       let hasMore = true;
 
       while (hasMore) {
-        const result = await mlApiGet(`/users/${sellerId}/items/search?offset=${offset}&limit=50`);
+        const result = await mlApiGet(`/users/${sellerId}/items/search?status=active&offset=${offset}&limit=50`);
         allItems = allItems.concat(result.results || []);
         offset += 50;
         hasMore = offset < (result.paging ? result.paging.total : 0);
         if (hasMore) await sleep(200);
       }
 
-      console.log(`[mlEstoque] ${allItems.length} itens encontrados`);
+      console.log(`[mlEstoque] ${allItems.length} itens ATIVOS encontrados`);
 
       const produtos = [];
       const batchSize = 20;
+      let debugCount = 0;
 
       for (let i = 0; i < allItems.length; i += batchSize) {
         const batch = allItems.slice(i, i + batchSize);
@@ -973,6 +975,7 @@ exports.mlSincronizarEstoque = functions
         for (const wrapper of itemsData) {
           if (wrapper.code !== 200 || !wrapper.body) continue;
           const item = wrapper.body;
+          if (item.status !== "active") continue;
 
           function extractSku(obj, item) {
             if (obj.seller_custom_field) return obj.seller_custom_field;
@@ -981,62 +984,108 @@ exports.mlSincronizarEstoque = functions
               if (skuAttr && skuAttr.value_name) return skuAttr.value_name;
             }
             if (item && item.seller_custom_field) return item.seller_custom_field;
-            if (obj.inventory_id) return obj.inventory_id;
-            return item.id + (obj.id ? "_" + obj.id : "");
+            return null;
           }
 
-          if (!item.variations || item.variations.length === 0) {
-            const invId = item.inventory_id;
+          // Processar variações ou item sem variação
+          const variations = (item.variations && item.variations.length > 0) ? item.variations : [item];
+
+          for (const v of variations) {
+            const isVariation = v !== item;
+            const invId = isVariation ? v.inventory_id : item.inventory_id;
+            const sku = extractSku(isVariation ? v : item, item);
+
+            // Buscar estoque Full
             let stockData = null;
             if (invId) {
-              try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
-            }
-            const aptas = stockData ? (stockData.available_quantity || 0) : (item.available_quantity || 0);
-            produtos.push({
-              item_id: item.id, titulo: item.title, sku: extractSku(item, item),
-              preco: item.price, status: item.status, inventory_id: invId || "",
-              available_quantity: item.available_quantity || 0,
-              full_aptas: aptas, full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
-            });
-          } else {
-            for (const v of item.variations) {
-              const invId = v.inventory_id;
-              let stockData = null;
-              if (invId) {
-                try { stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`); } catch (e) { /* sem Full */ }
+              try {
+                stockData = await mlApiGet(`/inventories/${invId}/stock/fulfillment`);
+                // Debug: logar primeiros 3 responses
+                if (debugCount < 3) {
+                  console.log(`[mlEstoque] DEBUG fulfillment invId=${invId}: ${JSON.stringify(stockData).substring(0, 300)}`);
+                  debugCount++;
+                }
+              } catch (e) {
+                // Sem fulfillment — item pode não ser Full
               }
-              const aptas = stockData ? (stockData.available_quantity || 0) : (v.available_quantity || 0);
-              produtos.push({
-                item_id: item.id, variation_id: v.id, titulo: item.title, sku: extractSku(v, item),
-                preco: item.price, status: item.status, inventory_id: invId || "",
-                available_quantity: v.available_quantity || 0,
-                full_aptas: aptas, full_not_available: stockData ? (stockData.not_available_quantity || 0) : 0,
-              });
-              await sleep(100);
             }
+
+            // Extrair quantidades do fulfillment
+            let aptas = 0, emTransferencia = 0, entradaPendente = 0, naoAptas = 0, devolvidas = 0;
+
+            if (stockData) {
+              // stockData pode ser objeto direto ou ter detail/locations
+              if (stockData.available_quantity !== undefined) {
+                aptas = stockData.available_quantity || 0;
+                naoAptas = stockData.not_available_quantity || 0;
+              }
+              // Verificar se tem detail com breakdown
+              if (stockData.detail) {
+                const d = stockData.detail;
+                aptas = d.available_quantity || aptas;
+                naoAptas = d.not_available_quantity || naoAptas;
+                emTransferencia = d.in_transit_quantity || d.transfer_quantity || 0;
+                entradaPendente = d.pending_quantity || 0;
+              }
+              // Verificar locations (novo formato)
+              if (stockData.locations && Array.isArray(stockData.locations)) {
+                let totalAptas = 0, totalNaoAptas = 0;
+                for (const loc of stockData.locations) {
+                  totalAptas += loc.available_quantity || 0;
+                  totalNaoAptas += loc.not_available_quantity || 0;
+                }
+                if (totalAptas > 0) aptas = totalAptas;
+                if (totalNaoAptas > 0) naoAptas = totalNaoAptas;
+              }
+            }
+
+            // Total = tudo que está no sistema Full (aptas + transferência + entrada)
+            const totalFull = aptas + emTransferencia + entradaPendente;
+
+            // Só adicionar se tem qualquer estoque ou o item está ativo com SKU
+            if (totalFull > 0 || aptas > 0) {
+              produtos.push({
+                item_id: item.id,
+                variation_id: isVariation ? v.id : null,
+                titulo: item.title,
+                sku: sku || (invId || item.id),
+                preco: item.price,
+                status: item.status,
+                inventory_id: invId || "",
+                full_aptas: aptas,
+                full_transferencia: emTransferencia,
+                full_entrada: entradaPendente,
+                full_nao_aptas: naoAptas,
+                full_total: totalFull,
+              });
+            }
+
+            if (isVariation) await sleep(100);
           }
         }
         await sleep(300);
       }
 
-      const ativos = produtos.filter(p => p.full_aptas > 0 || p.available_quantity > 0);
+      // Ordenar por aptas desc
+      produtos.sort((a, b) => b.full_aptas - a.full_aptas);
 
-      console.log(`[mlEstoque] SKUs ativos: ${ativos.map(p => p.sku + '(' + p.full_aptas + ')').join(', ')}`);
-      const semSku = produtos.filter(p => !p.sku || p.sku === "");
-      if (semSku.length > 0) console.log(`[mlEstoque] AVISO: ${semSku.length} itens sem SKU`);
+      console.log(`[mlEstoque] ${produtos.length} SKUs com estoque:`);
+      produtos.forEach(p => {
+        console.log(`[mlEstoque]   ${p.sku}: aptas=${p.full_aptas} transf=${p.full_transferencia} total=${p.full_total} | ${p.titulo.substring(0, 50)}`);
+      });
 
       await db.collection("config").doc("ml_estoque_sync").set({
         ultima_sincronizacao: new Date().toISOString(),
-        total_itens: allItems.length, total_skus: produtos.length, total_ativos: ativos.length,
+        total_itens: allItems.length, total_skus: produtos.length,
         duracao_seg: ((Date.now() - startTime) / 1000).toFixed(1),
       });
 
       const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[mlEstoque] Concluído em ${duracao}s: ${ativos.length} SKUs ativos de ${produtos.length} total`);
+      console.log(`[mlEstoque] Concluído em ${duracao}s: ${produtos.length} SKUs com estoque de ${allItems.length} itens ativos`);
 
       return {
         success: true, total_itens: allItems.length, total_skus: produtos.length,
-        total_ativos: ativos.length, produtos: ativos, duracao: duracao,
+        produtos, duracao,
       };
     } catch (err) {
       console.error("[mlEstoque] Erro:", err);
@@ -1275,67 +1324,6 @@ exports.mpSincronizar = functions
       };
     } catch (err) {
       console.error("[mpSync v2] Erro:", err);
-      return { success: false, error: err.message };
-    }
-  });
-
-// ══════════════════════════════════════════════════════════
-//  DEBUG — EXPLORAR ENDPOINTS MP/ML
-// ══════════════════════════════════════════════════════════
-exports.mpDebug = functions
-  .runWith({ timeoutSeconds: 30, memory: "256MB" })
-  .https.onCall(async (data, context) => {
-    try {
-      const token = await getMLToken();
-      const tokenDoc = await db.collection("config").doc("ml_tokens").get();
-      const sellerId = tokenDoc.data().user_id;
-      const fetch = (await import("node-fetch")).default;
-
-      const endpoints = [
-        `/users/${sellerId}`,
-        `/users/me`,
-        `/users/${sellerId}/mercadopago_account`,
-        `/users/${sellerId}/mercadopago_account/balance`,
-        `/users/${sellerId}/available_balance`,
-      ];
-
-      const mpEndpoints = [
-        `https://api.mercadopago.com/users/${sellerId}/mercadopago_account/balance`,
-        `https://api.mercadopago.com/v1/account/balance`,
-        `https://api.mercadopago.com/v1/balance`,
-        `https://api.mercadopago.com/merchant_orders/search?seller=${sellerId}&limit=1`,
-      ];
-
-      const results = [];
-
-      for (const ep of endpoints) {
-        try {
-          const url = `https://api.mercadolibre.com${ep}`;
-          const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-          const text = await res.text();
-          const preview = text.substring(0, 500);
-          console.log(`[mpDebug] ML ${ep} (${res.status}): ${preview}`);
-          results.push({ endpoint: ep, status: res.status, preview });
-        } catch (e) {
-          results.push({ endpoint: ep, error: e.message });
-        }
-      }
-
-      for (const url of mpEndpoints) {
-        try {
-          const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-          const text = await res.text();
-          const preview = text.substring(0, 500);
-          const shortUrl = url.replace("https://api.mercadopago.com", "MP");
-          console.log(`[mpDebug] ${shortUrl} (${res.status}): ${preview}`);
-          results.push({ endpoint: shortUrl, status: res.status, preview });
-        } catch (e) {
-          results.push({ endpoint: url, error: e.message });
-        }
-      }
-
-      return { success: true, results };
-    } catch (err) {
       return { success: false, error: err.message };
     }
   });
