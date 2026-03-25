@@ -1116,39 +1116,47 @@ exports.mpSincronizar = functions
       console.log(`[mpSync v2] Iniciado para seller ${sellerId}`);
 
       // ── 1. SALDO DA CONTA ──
+      // Tenta múltiplos endpoints pois o principal retorna 403 em algumas configs
       let balance = { available: 0, unavailable: 0, total: 0 };
-      try {
-        const balRes = await fetch(
-          `${ML_CONFIG.API_BASE}/users/${sellerId}/mercadopago_account/balance`,
-          { headers: { "Authorization": `Bearer ${token}` } }
-        );
-        if (balRes.ok) {
-          const b = await balRes.json();
-          balance = {
-            available: b.available_balance || 0,
-            unavailable: b.unavailable_balance || 0,
-            total: (b.available_balance || 0) + (b.unavailable_balance || 0),
-          };
-          console.log(`[mpSync v2] Saldo: disponivel=${balance.available}, a liberar=${balance.unavailable}`);
-        } else {
-          const errText = await balRes.text();
-          console.warn(`[mpSync v2] Balance API ${balRes.status}: ${errText.substring(0, 200)}`);
+      const balanceEndpoints = [
+        { url: `https://api.mercadopago.com/users/${sellerId}/mercadopago_account/balance`, name: "MP balance" },
+        { url: `${ML_CONFIG.API_BASE}/users/${sellerId}/mercadopago_account/balance`, name: "ML balance" },
+        { url: `https://api.mercadopago.com/v1/account/balance`, name: "MP v1 balance" },
+        { url: `${ML_CONFIG.API_BASE}/users/${sellerId}/balance`, name: "ML user balance" },
+      ];
+
+      for (const ep of balanceEndpoints) {
+        try {
+          const balRes = await fetch(ep.url, { headers: { "Authorization": `Bearer ${token}` } });
+          const text = await balRes.text();
+          console.log(`[mpSync v2] ${ep.name} (${balRes.status}): ${text.substring(0, 300)}`);
+          if (balRes.ok) {
+            const b = JSON.parse(text);
+            balance = {
+              available: b.available_balance || b.available || 0,
+              unavailable: b.unavailable_balance || b.unavailable || 0,
+              total: (b.available_balance || b.available || 0) + (b.unavailable_balance || b.unavailable || 0),
+            };
+            console.log(`[mpSync v2] Saldo OK via ${ep.name}: disponivel=${balance.available}, a liberar=${balance.unavailable}`);
+            break; // Encontrou, para de tentar
+          }
+        } catch (e) {
+          console.warn(`[mpSync v2] ${ep.name} erro: ${e.message}`);
         }
-      } catch (e) {
-        console.warn("[mpSync v2] Erro saldo:", e.message);
       }
 
-      // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (próximos 35 dias) ──
+      // ── 2. BUSCAR PAYMENTS POR DATA DE LIBERAÇÃO (D+1 a D+35) ──
+      // Começa em D+1 pois D0 já está sendo liberado ao longo do dia (vai pro saldo)
       const hoje = new Date();
       const hojeStr = hoje.toISOString().split("T")[0];
-      const ontem = new Date(hoje);
-      ontem.setDate(ontem.getDate() - 1);
+      const amanha = new Date(hoje);
+      amanha.setDate(amanha.getDate() + 1);
       const ate35 = new Date(hoje);
       ate35.setDate(ate35.getDate() + 35);
-      const beginDate = ontem.toISOString().split(".")[0] + ".000-03:00";
-      const endDate = ate35.toISOString().split(".")[0] + ".000-03:00";
+      const beginDate = amanha.toISOString().split("T")[0] + "T00:00:00.000-03:00";
+      const endDate = ate35.toISOString().split("T")[0] + "T23:59:59.000-03:00";
 
-      console.log(`[mpSync v2] Buscando payments de ${beginDate} até ${endDate}`);
+      console.log(`[mpSync v2] Buscando payments de ${beginDate} até ${endDate} (D+1 a D+35)`);
 
       let allPayments = [];
       let offset = 0;
@@ -1197,29 +1205,39 @@ exports.mpSincronizar = functions
       }
 
       // ── 3. AGRUPAR POR DATA DE LIBERAÇÃO ──
+      // Apenas payments PENDENTES de liberação (não os já liberados)
       const paymentMap = {};
       let totalAReceber = 0;
-      let totalAPagar = 0;
+      let skippedReleased = 0;
+      let skippedNegative = 0;
 
       for (const pmt of allPayments) {
         const releaseDate = pmt.money_release_date;
         if (!releaseDate) continue;
 
+        // Pular payments já liberados — só queremos os futuros
+        if (pmt.money_release_status === "released") {
+          skippedReleased++;
+          continue;
+        }
+
         const relDateStr = releaseDate.substring(0, 10);
         const relHora = releaseDate.substring(11, 16) || "";
 
-        // net_received_amount pode estar em transaction_details ou direto no payment
+        // net_received_amount está em transaction_details
         const tdNet = pmt.transaction_details ? (pmt.transaction_details.net_received_amount || 0) : 0;
         const directNet = pmt.net_received_amount || 0;
         const netAmount = tdNet || directNet || 0;
         const grossAmount = pmt.transaction_amount || 0;
         const taxas = grossAmount - netAmount;
 
-        if (netAmount >= 0) {
-          totalAReceber += netAmount;
-        } else {
-          totalAPagar += Math.abs(netAmount);
+        // Apenas recebíveis positivos — "a pagar" será tratado no Contas a Pagar
+        if (netAmount <= 0) {
+          skippedNegative++;
+          continue;
         }
+
+        totalAReceber += netAmount;
 
         if (!paymentMap[relDateStr]) {
           paymentMap[relDateStr] = { total: 0, bruto: 0, taxas: 0, lancamentos: [] };
@@ -1261,8 +1279,8 @@ exports.mpSincronizar = functions
         ultima_sincronizacao: new Date().toISOString(),
         balance,
         total_a_receber: totalAReceber,
-        total_a_pagar: totalAPagar,
         total_pagamentos: allPayments.length,
+        payments_pendentes: allPayments.length - skippedReleased - skippedNegative,
       });
 
       await db.collection("config").doc("mp_calendario").set({
@@ -1271,7 +1289,7 @@ exports.mpSincronizar = functions
       });
 
       const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[mpSync v2] Concluido em ${duracao}s: ${allPayments.length} payments, ${calendarioFuturo.length} dias futuros, total a receber: ${totalAReceber}`);
+      console.log(`[mpSync v2] Concluido em ${duracao}s: ${allPayments.length} payments total, ${skippedReleased} já liberados, ${skippedNegative} negativos, ${calendarioFuturo.length} dias futuros, total a receber: ${totalAReceber.toFixed(2)}`);
 
       return {
         success: true,
@@ -1279,9 +1297,9 @@ exports.mpSincronizar = functions
         balance,
         resumo: {
           total_a_receber: totalAReceber,
-          total_a_pagar: totalAPagar,
-          saldo_projetado: balance.available + totalAReceber - totalAPagar,
-          total_pagamentos: allPayments.length,
+          total_a_pagar: 0,
+          saldo_projetado: balance.available + totalAReceber,
+          total_pagamentos: allPayments.length - skippedReleased - skippedNegative,
         },
         calendario_futuro: calendarioFuturo.slice(0, 60),
         calendario_passado_resumo: {
