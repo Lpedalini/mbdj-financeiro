@@ -148,6 +148,8 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
   .dash-cards { grid-template-columns:1fr !important; }
   .header-lock { padding:4px 6px; font-size:10px; }
 }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
 </style>
 
   <!-- Firebase SDK -->
@@ -4842,7 +4844,7 @@ function renderEstoque() {
   var totalSkus = skus.length;
   var totalPecas = posicao.reduce(function(s,p){ return s+p.qtd_atual; },0);
   var custoTotal = posicao.reduce(function(s,p){ return s+p.custo_total; },0);
-  var totalACaminho = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_a_caminho)||0); },0);
+  var totalACaminho = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_transferencia)||parseInt(sk.full_a_caminho)||0); },0);
   var totalVendas30d = skus.reduce(function(s,sk){ return s + (parseInt(sk.vendas_30d)||0); },0);
   var abaixoMinimo = posicao.filter(function(p){
     var v30 = parseInt(p.sku.vendas_30d)||0;
@@ -4931,7 +4933,7 @@ function _renderTabelaEstoque(posicao) {
     var v30 = parseInt(sku.vendas_30d)||0;
     var vel = v30 > 0 ? (v30/30) : 0;
     var dias = vel > 0 ? Math.round(p.qtd_atual / vel) : (p.qtd_atual > 0 ? 999 : 0);
-    var aCaminho = parseInt(sku.full_a_caminho)||0;
+    var aCaminho = parseInt(sku.full_transferencia)||parseInt(sku.full_a_caminho)||0;
     totalF += p.custo_total;
 
     var alertBadge = '';
@@ -5336,9 +5338,12 @@ function sincronizarEstoqueML() {
       return;
     }
 
-    showToast('⏳ Sincronizando estoque com ML... Pode levar até 1 minuto.');
     var btn = document.getElementById('btn-sync-ml');
-    if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
+    if(btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;"><span class="spin-anim" style="display:inline-block;width:14px;height:14px;border:2px solid rgba(255,230,0,0.3);border-top:2px solid #FFE600;border-radius:50%;animation:spin 0.8s linear infinite;"></span> Sincronizando...</span>'; }
+    // Overlay na tabela
+    var wrap = document.getElementById('est-tabela-wrap');
+    if(wrap) { wrap.innerHTML = '<div style="padding:60px;text-align:center;background:rgba(255,255,255,0.95);border-radius:10px;border:1px solid #e0e0e0;"><div style="font-size:36px;margin-bottom:12px;animation:pulse 1.5s infinite;">🔄</div><div style="font-size:14px;font-weight:600;color:#2D3277;">Sincronizando com Mercado Livre...</div><div style="font-size:12px;color:#888;margin-top:6px;">Buscando itens ativos e estoque Full. Pode levar até 1 minuto.</div></div>'; }
+    showToast('⏳ Conectando ao Mercado Livre...');
 
     var fnSync = firebase.functions().httpsCallable('mlSincronizarEstoque');
     fnSync({}).then(function(result) {
@@ -5360,35 +5365,44 @@ function sincronizarEstoqueML() {
         var idx = skus.findIndex(function(s){ return s.sku === p.sku; });
 
         if(idx >= 0) {
+          // Atualizar dados ML preservando custo e config manual
           skus[idx].ml_item_id = p.item_id;
           skus[idx].ml_inventory_id = p.inventory_id;
-          skus[idx].full_aptas = p.full_aptas;
-          skus[idx].full_a_caminho = 0;
+          skus[idx].full_aptas = p.full_aptas || 0;
+          skus[idx].full_transferencia = p.full_transferencia || 0;
+          skus[idx].full_entrada = p.full_entrada || 0;
+          skus[idx].full_nao_aptas = p.full_nao_aptas || 0;
+          skus[idx].full_total = p.full_total || 0;
           skus[idx].preco_ml = p.preco;
           skus[idx].ml_atualizado_em = hoje;
+          // Ajuste de estoque com quantidade = aptas + transferência
+          var qtdTotal = (p.full_aptas || 0) + (p.full_transferencia || 0) + (p.full_entrada || 0);
           movs.push({
             id: gerarIdMov(), sku_id: skus[idx].id, tipo: 'ajuste',
-            data: hoje, qtd: p.full_aptas,
+            data: hoje, qtd: qtdTotal,
             custo_unitario: skus[idx].custo_medio || 'R$ 0,00',
-            nfe: '', historico: 'Sync ML API: '+p.full_aptas+' aptas ('+p.titulo.substring(0,40)+')',
+            nfe: '', historico: 'Sync ML: aptas='+p.full_aptas+' transf='+(p.full_transferencia||0)+' entrada='+(p.full_entrada||0)+' | '+p.titulo.substring(0,35),
             _fonte: 'ml_api'
           });
           atualizados++;
         } else {
           var novoId = gerarIdEstoque();
+          var qtdTotal = (p.full_aptas || 0) + (p.full_transferencia || 0) + (p.full_entrada || 0);
           skus.push({
             id: novoId, sku: p.sku, descricao: p.titulo,
             unidade: 'un', custo_medio: 'R$ 0,00', estoque_minimo: 0,
             fornecedor: '', localizacao: 'ML Full', observacao: '',
             ml_item_id: p.item_id, ml_inventory_id: p.inventory_id,
-            full_aptas: p.full_aptas, full_a_caminho: 0,
+            full_aptas: p.full_aptas || 0, full_transferencia: p.full_transferencia || 0,
+            full_entrada: p.full_entrada || 0, full_nao_aptas: p.full_nao_aptas || 0,
+            full_total: p.full_total || 0,
             preco_ml: p.preco, ml_atualizado_em: hoje, criado_em: hoje
           });
-          if(p.full_aptas > 0) {
+          if(qtdTotal > 0) {
             movs.push({
               id: gerarIdMov(), sku_id: novoId, tipo: 'ajuste',
-              data: hoje, qtd: p.full_aptas, custo_unitario: 'R$ 0,00',
-              nfe: '', historico: 'Carga ML API: '+p.full_aptas+' aptas ('+p.titulo.substring(0,40)+')',
+              data: hoje, qtd: qtdTotal, custo_unitario: 'R$ 0,00',
+              nfe: '', historico: 'Carga ML: aptas='+p.full_aptas+' transf='+(p.full_transferencia||0)+' | '+p.titulo.substring(0,35),
               _fonte: 'ml_api'
             });
           }
@@ -5399,7 +5413,7 @@ function sincronizarEstoqueML() {
       setSkus(skus);
       setMovs(movs);
       renderEstoque();
-      showToast('✅ ML sincronizado em '+r.duracao+'s! '+novos+' novo(s) · '+atualizados+' atualizado(s) · '+r.total_ativos+' SKUs ativos');
+      showToast('✅ ML sincronizado em '+r.duracao+'s! '+novos+' novo(s) · '+atualizados+' atualizado(s) · '+r.total_skus+' SKUs com estoque');
 
     }).catch(function(err) {
       if(btn) { btn.disabled = false; btn.textContent = '🔗 Sincronizar ML'; }
@@ -6215,8 +6229,8 @@ async function uploadCertificadoSefaz() {
 
 function sincronizarMP() {
   var btn = document.getElementById('btn-sync-mp');
-  if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
-  showToast('⏳ Conectando ao Mercado Pago... Pode levar até 2 minutos.');
+  if(btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;"><span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,0.3);border-top:2px solid #fff;border-radius:50%;animation:spin 0.8s linear infinite;"></span> Sincronizando...</span>'; }
+  showToast('⏳ Conectando ao Mercado Pago...');
 
   var fn = firebase.functions().httpsCallable('mpSincronizar');
   fn({}).then(function(result) {
@@ -6225,17 +6239,6 @@ function sincronizarMP() {
     if(!r.success) {
       showToast('❌ Erro: ' + (r.error || 'Erro desconhecido'), true);
       return;
-    }
-
-    // Atualizar saldo da conta Mercado Pago nas contas bancárias
-    var contas = getData('contas_bancarias');
-    var mpIdx = contas.findIndex(function(c) { return c.nome === 'Mercado Pago' || c.banco === 'Mercado Pago'; });
-    if(mpIdx >= 0) {
-      contas[mpIdx].saldoInicial = formatCurrency(r.balance.available || 0);
-      contas[mpIdx]._mpUnavailable = r.balance.unavailable || 0;
-      contas[mpIdx]._mpTotal = r.balance.total || 0;
-      contas[mpIdx]._mpSyncAt = new Date().toISOString();
-      setData('contas_bancarias', contas);
     }
 
     // Gerar/atualizar títulos no Contas a Receber para liberações futuras
@@ -6296,8 +6299,7 @@ function sincronizarMP() {
     pesquisarCR();
 
     var msg = '✅ MP sincronizado em ' + r.duracao + 's! ';
-    msg += 'Saldo: ' + formatCurrency(r.balance.available) + ' disponível';
-    if(r.resumo.total_a_receber > 0) msg += ' · A receber: ' + formatCurrency(r.resumo.total_a_receber);
+    msg += 'A receber: ' + formatCurrency(r.resumo.total_a_receber) + ' (' + (r.resumo.total_pagamentos || 0) + ' pagamentos)';
     showToast(msg);
 
   }).catch(function(err) {
@@ -6322,16 +6324,11 @@ function carregarPainelMP() {
       var calPassado = calendario.filter(function(c) { return c.data < hojeStr; });
 
       var syncData = {
-        balance: d.balance || { available: 0, unavailable: 0, total: 0 },
         resumo: {
           total_a_receber: d.total_a_receber || 0,
-          total_a_pagar: d.total_a_pagar || 0,
-          saldo_projetado: (d.balance ? d.balance.available : 0) + (d.total_a_receber || 0) - (d.total_a_pagar || 0),
-          total_pedidos: d.total_pedidos || 0,
-          total_pagamentos: d.total_pagamentos || 0,
+          total_pagamentos: d.payments_pendentes || d.total_pagamentos || 0,
         },
         calendario_futuro: calFuturo,
-        calendario_passado_resumo: { dias: calPassado.length, total: calPassado.reduce(function(s, c) { return s + c.total; }, 0) },
         _ultima_sync: d.ultima_sincronizacao || '',
       };
       window._mpLastSync = syncData;
@@ -6343,9 +6340,8 @@ function carregarPainelMP() {
 function renderPainelMP(data) {
   var panel = document.getElementById('mp-panel');
   if(!panel) return;
-  if(!data || !data.balance) { panel.innerHTML = ''; return; }
+  if(!data || !data.resumo) { panel.innerHTML = ''; return; }
 
-  var b = data.balance;
   var r = data.resumo || {};
   var cal = data.calendario_futuro || [];
   var lastSync = data._ultima_sync || '';
@@ -6359,14 +6355,11 @@ function renderPainelMP(data) {
 
   html += '<div style="padding:14px;">';
 
-  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">';
-  html += '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#166534;font-weight:600;text-transform:uppercase;">Disponível</div><div style="font-size:20px;font-weight:800;color:#16a34a;">' + formatCurrency(b.available) + '</div></div>';
-  html += '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#1e40af;font-weight:600;text-transform:uppercase;">A Liberar</div><div style="font-size:20px;font-weight:800;color:#2563eb;">' + formatCurrency(b.unavailable) + '</div></div>';
-  html += '<div style="background:#fefce8;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#854d0e;font-weight:600;text-transform:uppercase;">Total Conta</div><div style="font-size:20px;font-weight:800;color:#ca8a04;">' + formatCurrency(b.total) + '</div></div>';
   if(r.total_a_receber > 0) {
-    html += '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;text-align:center;"><div style="font-size:10px;color:#0c4a6e;font-weight:600;text-transform:uppercase;">A Receber 30d</div><div style="font-size:20px;font-weight:800;color:#0284c7;">' + formatCurrency(r.total_a_receber) + '</div></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:14px;">';
+    html += '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:12px 16px;text-align:center;"><div style="font-size:10px;color:#0c4a6e;font-weight:600;text-transform:uppercase;">Total a Receber</div><div style="font-size:24px;font-weight:800;color:#0284c7;">' + formatCurrency(r.total_a_receber) + '</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">' + (r.total_pagamentos || 0) + ' pagamentos pendentes</div></div>';
+    html += '</div>';
   }
-  html += '</div>';
 
   if(cal.length > 0) {
     var totalCal = cal.reduce(function(s, d) { return s + d.total; }, 0);
