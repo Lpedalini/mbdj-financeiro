@@ -1049,13 +1049,12 @@ exports.mlSincronizarEstoque = functions
 
             const skuKey = sku || (invId || item.id);
 
-            // Deduplicar: variações com mesmo inventory_id compartilham estoque
-            const dedupKey = invId || skuKey;
-            if (skusSeen.has(dedupKey)) continue;
+            // Deduplicar por anúncio (item.id) — variações do mesmo anúncio = mesmo estoque
+            if (skusSeen.has(item.id)) continue;
 
             // Só adicionar se tem qualquer estoque
             if (totalFull > 0 || aptas > 0) {
-              skusSeen.add(dedupKey);
+              skusSeen.add(item.id);
               produtos.push({
                 item_id: item.id,
                 variation_id: isVariation ? v.id : null,
