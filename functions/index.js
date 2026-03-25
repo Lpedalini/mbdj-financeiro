@@ -1016,36 +1016,25 @@ exports.mlSincronizarEstoque = functions
             }
 
             // Extrair quantidades do fulfillment
-            let aptas = 0, emTransferencia = 0, entradaPendente = 0, naoAptas = 0, devolvidas = 0;
+            let aptas = 0, emTransferencia = 0, entradaPendente = 0, naoAptas = 0, extraviadas = 0, emRevisao = 0;
 
             if (stockData) {
-              // stockData pode ser objeto direto ou ter detail/locations
-              if (stockData.available_quantity !== undefined) {
-                aptas = stockData.available_quantity || 0;
-                naoAptas = stockData.not_available_quantity || 0;
-              }
-              // Verificar se tem detail com breakdown
-              if (stockData.detail) {
-                const d = stockData.detail;
-                aptas = d.available_quantity || aptas;
-                naoAptas = d.not_available_quantity || naoAptas;
-                emTransferencia = d.in_transit_quantity || d.transfer_quantity || 0;
-                entradaPendente = d.pending_quantity || 0;
-              }
-              // Verificar locations (novo formato)
-              if (stockData.locations && Array.isArray(stockData.locations)) {
-                let totalAptas = 0, totalNaoAptas = 0;
-                for (const loc of stockData.locations) {
-                  totalAptas += loc.available_quantity || 0;
-                  totalNaoAptas += loc.not_available_quantity || 0;
+              aptas = stockData.available_quantity || 0;
+              naoAptas = stockData.not_available_quantity || 0;
+
+              // Breakdown de não-aptas
+              if (stockData.not_available_detail && Array.isArray(stockData.not_available_detail)) {
+                for (const d of stockData.not_available_detail) {
+                  if (d.status === "transfer") emTransferencia += (d.quantity || 0);
+                  else if (d.status === "pending" || d.status === "inbound") entradaPendente += (d.quantity || 0);
+                  else if (d.status === "lost") extraviadas += (d.quantity || 0);
+                  else if (d.status === "notSupported" || d.status === "damaged") emRevisao += (d.quantity || 0);
                 }
-                if (totalAptas > 0) aptas = totalAptas;
-                if (totalNaoAptas > 0) naoAptas = totalNaoAptas;
               }
             }
 
-            // Total = tudo que está no sistema Full (aptas + transferência + entrada)
-            const totalFull = aptas + emTransferencia + entradaPendente;
+            // Total = tudo no Full
+            const totalFull = stockData ? (stockData.total || (aptas + naoAptas)) : aptas;
 
             const skuKey = sku || (invId || item.id);
 
@@ -1072,6 +1061,8 @@ exports.mlSincronizarEstoque = functions
                 full_transferencia: emTransferencia,
                 full_entrada: entradaPendente,
                 full_nao_aptas: naoAptas,
+                full_extraviadas: extraviadas,
+                full_em_revisao: emRevisao,
                 full_total: totalFull,
               });
             }
@@ -1087,7 +1078,7 @@ exports.mlSincronizarEstoque = functions
 
       console.log(`[mlEstoque] ${produtos.length} SKUs com estoque:`);
       produtos.forEach(p => {
-        console.log(`[mlEstoque]   ${p.sku}: aptas=${p.full_aptas} transf=${p.full_transferencia} total=${p.full_total} | ${p.titulo.substring(0, 50)}`);
+        console.log(`[mlEstoque]   ${p.sku}: aptas=${p.full_aptas} transf=${p.full_transferencia} naoAptas=${p.full_nao_aptas} total=${p.full_total} | ${p.titulo.substring(0, 45)}`);
       });
 
       await db.collection("config").doc("ml_estoque_sync").set({
