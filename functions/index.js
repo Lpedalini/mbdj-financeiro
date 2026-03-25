@@ -1340,3 +1340,102 @@ exports.mpSincronizar = functions
 // ══════════════════════════════════════════════════════════
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function formatCurrencyBR(n) { return "R$ " + n.toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
+
+// ══════════════════════════════════════════════════════════
+//  SNAPSHOT DIÁRIO AGENDADO (meia-noite BRT)
+// ══════════════════════════════════════════════════════════
+exports.snapshotDiario = functions
+  .runWith({ timeoutSeconds: 60, memory: '256MB' })
+  .pubsub.schedule('0 3 * * *')  // 03:00 UTC = 00:00 BRT
+  .timeZone('America/Sao_Paulo')
+  .onRun(async (context) => {
+    const db = admin.firestore();
+    const now = new Date();
+    const dataISO = now.toISOString().split('T')[0];
+    const horaISO = now.toISOString().split('T')[1].substring(0,8);
+    const docId = dataISO + '_' + horaISO.replace(/:/g,'-') + '_scheduled';
+
+    function parseCur(v) {
+      if(typeof v === 'number') return v;
+      if(!v) return 0;
+      return parseFloat(String(v).replace(/[R$\s.]/g,'').replace(',','.')) || 0;
+    }
+
+    try {
+      // Carregar dados do Firestore
+      async function loadData(key) {
+        // Check for chunked data
+        const mainDoc = await db.collection('dados').doc(key).get();
+        if(!mainDoc.exists) return [];
+        const d = mainDoc.data();
+        if(d._chunked) {
+          let all = [];
+          for(let i = 0; i < d._totalChunks; i++) {
+            const chunk = await db.collection('dados').doc(key + '__chunk_' + i).get();
+            if(chunk.exists && chunk.data().valor) {
+              all = all.concat(JSON.parse(chunk.data().valor));
+            }
+          }
+          return all;
+        }
+        return d.valor ? JSON.parse(d.valor) : [];
+      }
+
+      const cpItems = await loadData('contas_pagar');
+      const crItems = await loadData('contas_receber');
+      const bancos = await loadData('contas_bancarias');
+      const skus = await loadData('estoque_skus');
+
+      const totalBancos = bancos.reduce((s,c) => s + parseCur(c.saldoInicial), 0);
+      const cpLiq = cpItems.filter(i => i.status === 'Liquidado');
+      const crLiq = crItems.filter(i => i.status === 'Liquidado');
+      const totalPago = cpLiq.reduce((s,i) => s + parseCur(i.valor), 0);
+      const totalRecebido = crLiq.reduce((s,i) => s + parseCur(i.valor), 0);
+      const saldoReal = totalBancos - totalPago + totalRecebido;
+
+      const cpAberto = cpItems.filter(i => i.status === 'Aberto');
+      const cpVencido = cpAberto.filter(i => i.vencimento < dataISO);
+      const crAberto = crItems.filter(i => i.status === 'Aberto');
+      const crVencido = crAberto.filter(i => i.vencimento < dataISO);
+
+      const totalUnidades = skus.reduce((s,sk) => s + (parseFloat(sk.qtd)||parseInt(sk.full_aptas)||0), 0);
+      const valorEstoque = skus.reduce((s,sk) => s + ((parseFloat(sk.qtd)||parseInt(sk.full_aptas)||0) * parseCur(sk.custoUnit||sk.custo||sk.custo_medio||'0')), 0);
+
+      const snapshot = {
+        data: dataISO, hora: horaISO, timestamp: now.toISOString(),
+        usuario: 'system', trigger: 'scheduled',
+        posicao: {
+          saldo_bancario: {
+            total_inicial: totalBancos, saldo_real: saldoReal,
+            contas: bancos.map(c => ({ nome: c.nome||'', saldo: parseCur(c.saldoInicial) }))
+          },
+          contas_pagar: {
+            total_aberto: cpAberto.reduce((s,i) => s+parseCur(i.valor),0),
+            total_vencido: cpVencido.reduce((s,i) => s+parseCur(i.valor),0),
+            qtd_aberto: cpAberto.length, qtd_vencido: cpVencido.length,
+            total_liquidado: totalPago, qtd_liquidado: cpLiq.length
+          },
+          contas_receber: {
+            total_aberto: crAberto.reduce((s,i) => s+parseCur(i.valor),0),
+            total_vencido: crVencido.reduce((s,i) => s+parseCur(i.valor),0),
+            qtd_aberto: crAberto.length, qtd_vencido: crVencido.length,
+            total_liquidado: totalRecebido, qtd_liquidado: crLiq.length
+          },
+          estoque: {
+            total_unidades: totalUnidades, valor_total: valorEstoque, qtd_skus: skus.length,
+            itens: skus.filter(sk => (parseFloat(sk.qtd)||parseInt(sk.full_aptas)||0)>0).map(sk => ({
+              sku: sk.nome||sk.sku||'', qtd: parseFloat(sk.qtd)||parseInt(sk.full_aptas)||0,
+              custo: parseCur(sk.custoUnit||sk.custo||sk.custo_medio||'0')
+            }))
+          }
+        }
+      };
+
+      await db.collection('snapshots').doc(docId).set(snapshot);
+      console.log('📸 Snapshot diário salvo:', docId);
+      return null;
+    } catch(e) {
+      console.error('Snapshot diário erro:', e);
+      return null;
+    }
+  });
