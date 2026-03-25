@@ -4842,15 +4842,16 @@ function renderEstoque() {
   var skus = getSkus(); var movs = getMov();
   var posicao = calcularPosicao(skus, movs);
   var totalSkus = skus.length;
-  var totalPecas = posicao.reduce(function(s,p){ return s+p.qtd_atual; },0);
-  var custoTotal = posicao.reduce(function(s,p){ return s+p.custo_total; },0);
+  var totalPecas = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_aptas)||0); },0);
+  var custoTotal = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_aptas)||0) * (parseCurrency(sk.custo_medio)||0); },0);
   var totalACaminho = skus.reduce(function(s,sk){ return s + (parseInt(sk.full_transferencia)||parseInt(sk.full_a_caminho)||0); },0);
   var totalVendas30d = skus.reduce(function(s,sk){ return s + (parseInt(sk.vendas_30d)||0); },0);
   var abaixoMinimo = posicao.filter(function(p){
+    var fa = parseInt(p.sku.full_aptas)||0;
     var v30 = parseInt(p.sku.vendas_30d)||0;
     var vel = v30/30;
-    var dias = vel > 0 ? p.qtd_atual / vel : 999;
-    return (p.qtd_atual <= 0 && v30 > 0) || (dias <= 21 && v30 > 10);
+    var dias = vel > 0 ? fa / vel : 999;
+    return (fa <= 0 && v30 > 0) || (dias <= 21 && v30 > 10);
   }).length;
 
   content.innerHTML =
@@ -4899,21 +4900,23 @@ function _renderTabelaEstoque(posicao) {
   var filtered = posicao.filter(function(p) {
     var match = !busca || p.sku.sku.toLowerCase().includes(busca) || p.sku.descricao.toLowerCase().includes(busca);
     if(!match) return false;
+    var fa = parseInt(p.sku.full_aptas)||0;
     var v30 = parseInt(p.sku.vendas_30d)||0;
     var vel = v30/30;
-    var dias = vel > 0 ? p.qtd_atual / vel : 999;
+    var dias = vel > 0 ? fa / vel : 999;
     if(status==='ok')      return dias > 21;
     if(status==='urgente') return dias <= 7 && v30 > 0;
     if(status==='atencao') return dias > 7 && dias <= 21 && v30 > 0;
-    if(status==='zerado')  return p.qtd_atual <= 0;
+    if(status==='zerado')  return fa <= 0;
     if(status==='excesso') return dias > 60;
     return true;
   });
 
   filtered.sort(function(a,b){
     var va = parseInt(a.sku.vendas_30d)||0; var vb = parseInt(b.sku.vendas_30d)||0;
-    var da = va > 0 ? a.qtd_atual / (va/30) : 999;
-    var db = vb > 0 ? b.qtd_atual / (vb/30) : 999;
+    var fa_a = parseInt(a.sku.full_aptas)||0; var fa_b = parseInt(b.sku.full_aptas)||0;
+    var da = va > 0 ? fa_a / (va/30) : 999;
+    var db = vb > 0 ? fa_b / (vb/30) : 999;
     return da - db;
   });
 
@@ -4930,14 +4933,17 @@ function _renderTabelaEstoque(posicao) {
   var totalF = 0;
   var rows = filtered.map(function(p) {
     var sku = p.sku;
+    var fullAptas = parseInt(sku.full_aptas) || 0;
+    var custoMed = parseCurrency(sku.custo_medio) || 0;
+    var custoTot = fullAptas * custoMed;
     var v30 = parseInt(sku.vendas_30d)||0;
     var vel = v30 > 0 ? (v30/30) : 0;
-    var dias = vel > 0 ? Math.round(p.qtd_atual / vel) : (p.qtd_atual > 0 ? 999 : 0);
+    var dias = vel > 0 ? Math.round(fullAptas / vel) : (fullAptas > 0 ? 999 : 0);
     var aCaminho = parseInt(sku.full_transferencia)||parseInt(sku.full_a_caminho)||0;
-    totalF += p.custo_total;
+    totalF += custoTot;
 
     var alertBadge = '';
-    if(p.qtd_atual <= 0 && v30 > 0) alertBadge = '<span style="background:#dc3545;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">SEM ESTOQUE</span>';
+    if(fullAptas <= 0 && v30 > 0) alertBadge = '<span style="background:#dc3545;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">SEM ESTOQUE</span>';
     else if(dias <= 7 && v30 > 0) alertBadge = '<span style="background:#dc3545;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">🔴 '+dias+'d</span>';
     else if(dias <= 21 && v30 > 0) alertBadge = '<span style="background:#f39c12;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">⚠️ '+dias+'d</span>';
     else if(dias <= 45) alertBadge = '<span style="background:#27ae60;color:white;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">✅ '+dias+'d</span>';
@@ -4945,17 +4951,17 @@ function _renderTabelaEstoque(posicao) {
     else alertBadge = '<span style="color:#ccc;font-size:10px;">—</span>';
 
     var velStr = vel > 0 ? vel.toFixed(1)+'/dia' : '—';
-    var qtdC = p.qtd_atual<=0?'#e74c3c':(dias<=7?'#e74c3c':(dias<=21?'#f39c12':'#27ae60'));
+    var qtdC = fullAptas<=0?'#e74c3c':(dias<=7?'#e74c3c':(dias<=21?'#f39c12':'#27ae60'));
 
     return '<tr style="border-bottom:1px solid #f0f0f0;">'+
       '<td style="padding:7px 10px;font-weight:700;font-size:12px;color:#1a5276;">'+sku.sku+'</td>'+
       '<td style="padding:7px 10px;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+sku.descricao+'</td>'+
-      '<td style="padding:7px 10px;text-align:center;font-weight:700;font-size:15px;color:'+qtdC+';">'+p.qtd_atual.toLocaleString('pt-BR')+'</td>'+
+      '<td style="padding:7px 10px;text-align:center;font-weight:700;font-size:15px;color:'+qtdC+';">'+fullAptas.toLocaleString('pt-BR')+'</td>'+
       '<td style="padding:7px 10px;text-align:center;font-size:12px;color:#f39c12;font-weight:'+(aCaminho>0?'700':'400')+';">'+(aCaminho>0?'+'+aCaminho:'—')+'</td>'+
       '<td style="padding:7px 10px;text-align:center;font-size:11px;color:#0d6efd;">'+velStr+'</td>'+
       '<td style="padding:7px 10px;text-align:center;">'+alertBadge+'</td>'+
-      '<td style="padding:7px 10px;text-align:right;font-size:11px;">'+formatCurrency(p.custo_medio)+'</td>'+
-      '<td style="padding:7px 10px;text-align:right;font-weight:700;font-size:11px;color:#1a5276;">'+formatCurrency(p.custo_total)+'</td>'+
+      '<td style="padding:7px 10px;text-align:right;font-size:11px;">'+formatCurrency(custoMed)+'</td>'+
+      '<td style="padding:7px 10px;text-align:right;font-weight:700;font-size:11px;color:#1a5276;">'+formatCurrency(custoTot)+'</td>'+
       '<td style="padding:7px 10px;white-space:nowrap;">'+
         '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'entrada\')" style="background:#27ae60;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Entrada">▲</button> '+
         '<button onclick="abrirMovimentacao(\''+sku.id+'\',\'saida\')" style="background:#e74c3c;color:#fff;border:none;padding:3px 7px;border-radius:4px;cursor:pointer;font-size:11px;" title="Saída">▼</button> '+
