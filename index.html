@@ -1185,58 +1185,522 @@ function showImportCP() {
   var body='<div style="padding:20px;"><div id="cp-upload-zone" style="border:3px dashed #1a5276;border-radius:12px;padding:40px;text-align:center;cursor:pointer;background:#f0f7ff;" ondragover="event.preventDefault();this.style.borderColor=\'#e67e22\';" ondragleave="this.style.borderColor=\'#1a5276\';" ondrop="event.preventDefault();this.style.borderColor=\'#1a5276\';handleCPFileObj(event.dataTransfer.files[0]);" onclick="document.getElementById(\'cp-file-input\').click();"><div style="font-size:48px;margin-bottom:10px;">📁</div><div style="font-size:16px;color:#1a5276;font-weight:bold;">Clique ou arraste seu arquivo CSV/Excel aqui</div><div style="font-size:13px;color:#666;margin-top:8px;">Formatos aceitos: .csv, .txt, .xlsx, .xls</div><input type="file" id="cp-file-input" accept=".csv,.txt,.xlsx,.xls" style="display:none;" onchange="handleCPFileObj(this.files[0]);"></div><div id="cp-import-preview" style="margin-top:15px;"></div></div>';
   openModal('📥 Importar Contas a Pagar via CSV/Excel', body, null, '900px');
 }
-function handleCPFileObj(file) {
-    if(!file) return;
-    var ext = file.name.split('.').pop().toLowerCase();
-    if(ext === 'csv' || ext === 'txt') {
-      var reader=new FileReader();
-      reader.onload=function(e){parseCPCSVAndPreview(e.target.result);};
-      reader.readAsText(file,'UTF-8');
-    } else if(ext === 'xlsx' || ext === 'xls') {
-      loadSheetJS(function(){
-        var reader = new FileReader();
-        reader.onload = function(e) {
+// ============================================================
+// === IMPORT V2 — Mapeamento manual com templates (CP/CR) ===
+// ============================================================
+
+// --- Normalização robusta de data (aceita Date obj, ISO, BR, serial Excel) ---
+function normDateSmart(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date && !isNaN(v)) {
+    var y = v.getFullYear();
+    var m = String(v.getMonth() + 1).padStart(2, '0');
+    var d = String(v.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + d;
+  }
+  if (typeof v === 'number' && v > 30000 && v < 80000) {
+    var dt = new Date(Math.round((v - 25569) * 86400 * 1000));
+    // corrige timezone pra usar data UTC (evita dia a menos no Brasil)
+    var y2 = dt.getUTCFullYear();
+    var m2 = String(dt.getUTCMonth() + 1).padStart(2, '0');
+    var d2 = String(dt.getUTCDate()).padStart(2, '0');
+    return y2 + '-' + m2 + '-' + d2;
+  }
+  var s = String(v).trim().replace(/^"|"$/g, '');
+  if (!s) return '';
+  // ISO (com ou sem 'T')
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  // BR DD/MM/YYYY ou DD-MM-YYYY
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  // BR curto DD/MM/YY
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
+  if (m) {
+    var yr = parseInt(m[3]);
+    yr = yr < 50 ? 2000 + yr : 1900 + yr;
+    return yr + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  }
+  // número como string → tenta serial Excel
+  var num = parseFloat(s.replace(',', '.'));
+  if (!isNaN(num) && num > 30000 && num < 80000) return normDateSmart(num);
+  return '';
+}
+
+// --- Normalização de valor monetário para número ---
+function normMoneyToNumber(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return v;
+  var s = String(v).trim().replace(/^"|"$/g, '').replace(/[R$\s]/g, '');
+  if (!s) return 0;
+  // formato BR: 1.234,56
+  if (s.indexOf(',') > -1 && (s.indexOf('.') === -1 || s.indexOf(',') > s.indexOf('.'))) {
+    s = s.replace(/\./g, '').replace(',', '.');
+  }
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// --- Escape HTML (segurança e preview) ---
+function escapeHtmlImport(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+// --- Leitura unificada CSV/Excel → { headers, rows } ---
+function parseFileToRows(file, callback) {
+  var ext = file.name.split('.').pop().toLowerCase();
+  var reader = new FileReader();
+
+  if (ext === 'csv' || ext === 'txt') {
+    reader.onload = function(e) {
+      try {
+        var text = e.target.result;
+        var lines = text.split(/\r?\n/).filter(function(l){return l.trim();});
+        if (lines.length < 2) { callback(null, 'Arquivo vazio'); return; }
+        var firstLine = lines[0].replace(/^\uFEFF/, '');
+        var sep = (firstLine.split(';').length > firstLine.split(',').length) ? ';' : ',';
+        function parseCSVLine(line) {
+          var result = [], cur = '', inQ = false;
+          for (var i = 0; i < line.length; i++) {
+            var c = line[i];
+            if (c === '"') {
+              if (inQ && line[i+1] === '"') { cur += '"'; i++; }
+              else inQ = !inQ;
+            } else if (c === sep && !inQ) {
+              result.push(cur); cur = '';
+            } else cur += c;
+          }
+          result.push(cur);
+          return result;
+        }
+        var headers = parseCSVLine(firstLine).map(function(h){return h.trim();});
+        var rows = [];
+        for (var i = 1; i < lines.length; i++) rows.push(parseCSVLine(lines[i]));
+        callback({ headers: headers, rows: rows }, null);
+      } catch(err) {
+        callback(null, 'Erro ao ler CSV: ' + err.message);
+      }
+    };
+    reader.readAsText(file, 'UTF-8');
+  } else if (ext === 'xlsx' || ext === 'xls') {
+    loadSheetJS(function() {
+      reader.onload = function(e) {
+        try {
           var wb = XLSX.read(new Uint8Array(e.target.result), {type:'array', cellDates:true});
-          var rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, defval:''});
-          var csv = rows.map(function(r){ return r.join(';'); }).join('\n');
-          parseCPCSVAndPreview(csv);
-        };
-        reader.readAsArrayBuffer(file);
-      });
-    } else {
-      alert('Formato n\u00e3o suportado. Use .csv, .txt, .xlsx ou .xls');
-    }
-    }function parseCPCSVAndPreview(csvText) {
-  var lines=csvText.split(/\r?\n/).filter(function(l){return l.trim();});
-  if(lines.length<2){alert('Arquivo vazio');return;}
-  var firstLine=lines[0].replace(/^\uFEFF/,'');
-  var sep=(firstLine.split(';').length>firstLine.split(',').length)?';':',';
-  var headers=firstLine.split(sep).map(function(h){return h.trim().replace(/^"|"$/g,'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');});
-  var mapping={numero:['numero','num'],emissao:['emissao','data_emissao'],vencimento:['vencimento','vencim','data_vencimento','data'],valor:['valor','value','v_bruto','valor_bruto'],fornecedor:['fornecedor','supplier','pessoa'],conta:['conta','account','banco'],planoContas:['plano_contas','plano','categoria'],centroCusto:['centro_custo','centro','cc'],empresa:['empresa','company'],historico:['historico','descricao','obs','tipo'],status:['status','situacao']};
-  var colMap={};
-  headers.forEach(function(h,i){
-    var hClean = h.replace(/\(.*?\)/g,'').trim();
-    for(var field in mapping){
-      if(mapping[field].some(function(a){return h.includes(a) || hClean.includes(a);})){
-        colMap[field]=i;break;
+          var ws = wb.Sheets[wb.SheetNames[0]];
+          var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:'', raw:true, blankrows:false});
+          if (rows.length < 2) { callback(null, 'Arquivo vazio'); return; }
+          var headers = rows[0].map(function(h){return String(h == null ? '' : h).trim();});
+          callback({ headers: headers, rows: rows.slice(1) }, null);
+        } catch(err) {
+          callback(null, 'Erro ao ler Excel: ' + err.message);
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  } else {
+    callback(null, 'Formato não suportado. Use .csv, .txt, .xlsx ou .xls');
+  }
+}
+
+// --- Sugestão automática de mapeamento (heurística inicial) ---
+function suggestMapping(headers, tipo) {
+  var kws = {
+    numero: ['numero do doc','num doc','nro doc','withdraw_id','numero'],
+    emissao: ['data emissao','emissao','data de emissao','criacao','date_created','data criacao'],
+    vencimento: ['data vencimento','vencimento','vencim','due'],
+    valor: ['valor bruto','v bruto','valor','amount','total'],
+    fornecedor: tipo === 'contas_pagar'
+      ? ['nome do titular','fornecedor','supplier','beneficiario','pagar para','pago a']
+      : ['nome do titular','cliente','customer','pagador','recebido de'],
+    conta: ['nome do banco','conta bancaria','bank_name'],
+    planoContas: ['plano de contas','plano contas','classificacao','categoria','category','plano'],
+    centroCusto: ['centro de custo','centro custo','cc'],
+    empresa: ['empresa','company'],
+    historico: ['historico','descricao','description','observacao','obs','memo'],
+    status: ['status','situacao','estado'],
+    documento: ['documento','doc','nota fiscal','nf','boleto'],
+    meioPagamento: ['meio de pagamento','meio pagamento','forma de pagamento','meio','pagamento']
+  };
+  var norm = function(s) {
+    return String(s).toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+      .replace(/\(.*?\)/g,'').trim();
+  };
+  var mapping = {};
+  var used = {};
+  // Ordem: maior keyword ganha (evita "conta" bater com "número da conta")
+  var candidates = [];
+  headers.forEach(function(h, idx) {
+    var hn = norm(h);
+    for (var field in kws) {
+      for (var j = 0; j < kws[field].length; j++) {
+        var kw = kws[field][j];
+        if (hn === kw) candidates.push({idx:idx, field:field, score: 1000 + kw.length});
+        else if (hn.indexOf(kw) !== -1) candidates.push({idx:idx, field:field, score: kw.length});
       }
     }
   });
-  if(colMap.emissao===undefined && colMap.vencimento!==undefined) colMap.emissao=colMap.vencimento;
-  var dataRows=[];
-  for(var i=1;i<lines.length;i++){var cols=lines[i].split(sep).map(function(c){return c.trim().replace(/^"|"$/g,'');});if(cols.length<2) continue;var row={};for(var field in colMap){row[field]=cols[colMap[field]]||'';}
-    // Para CP, converter valores negativos em positivos (MP exporta negativo para "A Pagar")
-    var rawVal = row.valor || '';
-    var numVal = parseFloat(rawVal.replace(/[R$\s.]/g,'').replace(',','.'));
-    if(!isNaN(numVal) && numVal < 0){ row.valor = String(Math.abs(numVal)); }
-    dataRows.push(row);
+  candidates.sort(function(a,b){return b.score - a.score;});
+  candidates.forEach(function(c) {
+    if (used[c.field]) return;
+    if (mapping[c.idx] !== undefined) return;
+    mapping[c.idx] = c.field;
+    used[c.field] = true;
+  });
+  return mapping;
+}
+
+// --- Storage de templates (reaproveita getData/setData Firestore) ---
+function getImportTemplates(tipo) {
+  return getData('import_templates_' + tipo) || [];
+}
+async function saveImportTemplate(tipo, template) {
+  var list = getImportTemplates(tipo);
+  if (template.id) {
+    var idx = list.findIndex(function(t){return t.id === template.id;});
+    if (idx >= 0) list[idx] = template; else list.push(template);
+  } else {
+    template.id = 'tpl_' + Date.now();
+    template.createdAt = new Date().toISOString();
+    list.push(template);
   }
-  if(dataRows.length===0){alert('Nenhum dado encontrado');return;}
-  window._cpImportData=dataRows;
-  var prev='<table style="width:100%;font-size:11px;border-collapse:collapse;"><thead><tr style="background:#1a5276;color:white;"><th style="padding:4px;">Número</th><th>Emissão</th><th>Vencimento</th><th>Valor</th><th>Fornecedor</th><th>Conta</th><th>Plano</th><th>Histórico</th></tr></thead><tbody>';
-  dataRows.forEach(function(r,i){var bg=i%2===0?'#fff':'#f8f9fa';prev+='<tr style="background:'+bg+';"><td style="padding:3px;border:1px solid #ddd;">'+(r.numero||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.emissao||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.vencimento||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.valor||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.fornecedor||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.conta||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.planoContas||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.historico||'')+'</td></tr>';});
-  prev+='</tbody></table>';
-  document.getElementById('cp-import-preview').innerHTML='<div style="max-height:300px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">'+prev+'</div><div style="margin-top:12px;text-align:center;"><button style="background:#28a745;color:white;border:none;padding:10px 30px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;" onclick="confirmImportCP()">✅ IMPORTAR '+dataRows.length+' TÍTULOS</button></div>';
+  template.updatedAt = new Date().toISOString();
+  await setData('import_templates_' + tipo, list);
+  return template;
+}
+async function deleteImportTemplate(tipo, id) {
+  var list = getImportTemplates(tipo).filter(function(t){return t.id !== id;});
+  await setData('import_templates_' + tipo, list);
+}
+
+// --- Modal de mapeamento (state global durante a sessão) ---
+window._importMappingState = null;
+
+function openImportMappingModal(tipo, file) {
+  parseFileToRows(file, function(result, err) {
+    if (err) { alert(err); return; }
+    window._importMappingState = {
+      tipo: tipo,
+      fileName: file.name,
+      headers: result.headers,
+      rows: result.rows,
+      mapping: suggestMapping(result.headers, tipo),
+      fixedValues: {},
+      inverterSinal: false,
+      currentTemplateId: null
+    };
+    renderImportMappingUI();
+  });
+}
+
+function renderImportMappingUI() {
+  var s = window._importMappingState;
+  if (!s) return;
+  var tipoLabel = s.tipo === 'contas_pagar' ? 'Contas a Pagar' : 'Contas a Receber';
+  var templates = getImportTemplates(s.tipo);
+
+  var FIELDS = [
+    {k:'', label:'-- ignorar --'},
+    {k:'numero', label:'Número do documento'},
+    {k:'emissao', label:'Data de Emissão'},
+    {k:'vencimento', label:'Data de Vencimento'},
+    {k:'valor', label:'Valor'},
+    {k:'fornecedor', label: s.tipo === 'contas_pagar' ? 'Fornecedor' : 'Cliente'},
+    {k:'conta', label:'Conta Bancária'},
+    {k:'planoContas', label:'Plano de Contas'},
+    {k:'centroCusto', label:'Centro de Custo'},
+    {k:'empresa', label:'Empresa'},
+    {k:'historico', label:'Histórico'},
+    {k:'status', label:'Status'}
+  ];
+  if (s.tipo === 'contas_receber') {
+    FIELDS.push({k:'documento', label:'Documento (NF/Boleto)'});
+    FIELDS.push({k:'meioPagamento', label:'Meio de Pagamento'});
+  }
+
+  var tplOpts = '<option value="">-- nenhum template --</option>';
+  templates.forEach(function(t) {
+    tplOpts += '<option value="'+t.id+'"'+(t.id===s.currentTemplateId?' selected':'')+'>'+escapeHtmlImport(t.nome)+'</option>';
+  });
+
+  // Linha de selects por coluna
+  var selectsRow = '<tr style="background:#1a5276;color:#fff;">';
+  s.headers.forEach(function(h, idx) {
+    var current = s.mapping[idx] || '';
+    var opts = FIELDS.map(function(f) {
+      return '<option value="'+f.k+'"'+(current===f.k?' selected':'')+'>'+f.label+'</option>';
+    }).join('');
+    selectsRow += '<th style="padding:6px;min-width:170px;border:1px solid #0d3a5c;vertical-align:top;">'
+      + '<div style="font-size:10px;opacity:0.85;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:190px;" title="'+escapeHtmlImport(h)+'">'+escapeHtmlImport(h)+'</div>'
+      + '<select onchange="setImportMappingColumn('+idx+', this.value)" style="width:100%;padding:4px;font-size:11px;color:#000;border-radius:3px;border:1px solid #ccc;">'+opts+'</select>'
+      + '</th>';
+  });
+  selectsRow += '</tr>';
+
+  // Preview até 5 linhas
+  var previewRows = '';
+  var maxPreview = Math.min(5, s.rows.length);
+  for (var i = 0; i < maxPreview; i++) {
+    previewRows += '<tr style="background:'+(i%2===0?'#fff':'#f8f9fa')+';">';
+    s.headers.forEach(function(h, idx) {
+      var v = s.rows[i] ? s.rows[i][idx] : '';
+      if (v instanceof Date && !isNaN(v)) v = normDateSmart(v);
+      previewRows += '<td style="padding:4px 6px;border:1px solid #ddd;font-size:11px;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+escapeHtmlImport(String(v==null?'':v))+'</td>';
+    });
+    previewRows += '</tr>';
+  }
+
+  // Campos com valor fixo (opcional)
+  var fixedFields = ['fornecedor','conta','planoContas','centroCusto','empresa','historico','status'];
+  if (s.tipo === 'contas_receber') {
+    fixedFields.push('documento');
+    fixedFields.push('meioPagamento');
+  }
+  var fixedHtml = fixedFields.map(function(f) {
+    var label = FIELDS.find(function(x){return x.k===f;}).label;
+    var val = s.fixedValues[f] || '';
+    var mapped = Object.values(s.mapping).indexOf(f) >= 0;
+    return '<div style="display:inline-block;margin:4px 10px 4px 0;vertical-align:top;">'
+      +'<label style="display:block;font-size:10px;color:#555;margin-bottom:2px;">'+label+(mapped?' <span style="color:#999;">(vindo de coluna)</span>':'')+'</label>'
+      +'<input type="text" placeholder="valor fixo (opcional)" value="'+escapeHtmlImport(val)+'" '
+      +'oninput="window._importMappingState.fixedValues[\''+f+'\']=this.value" '
+      +(mapped?'disabled ':'')
+      +'style="padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;width:180px;'+(mapped?'opacity:0.4;background:#f0f0f0;':'')+'">'
+      +'</div>';
+  }).join('');
+
+  var body = ''
+    + '<div style="padding:15px;">'
+    +   '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">'
+    +     '<div><strong>Arquivo:</strong> '+escapeHtmlImport(s.fileName)+'</div>'
+    +     '<div><strong>Linhas:</strong> '+s.rows.length+'</div>'
+    +     '<div style="flex:1;"></div>'
+    +     '<div>'
+    +       '<label style="font-size:12px;color:#555;margin-right:5px;">Template:</label>'
+    +       '<select onchange="applyImportTemplate(this.value)" style="padding:5px;font-size:12px;">'+tplOpts+'</select>'
+    +       (s.currentTemplateId ? ' <button onclick="deleteCurrentImportTemplate()" style="background:#dc3545;color:#fff;border:none;padding:5px 10px;border-radius:4px;cursor:pointer;font-size:11px;margin-left:4px;" title="Apagar template">🗑️</button>' : '')
+    +     '</div>'
+    +   '</div>'
+    +   '<div style="background:#fffbea;border-left:4px solid #f39c12;padding:10px 14px;border-radius:4px;margin-bottom:12px;font-size:12px;line-height:1.5;">'
+    +     '💡 <strong>Como usar:</strong> Para cada coluna do arquivo, escolha no dropdown para qual campo ela deve ir. Colunas marcadas como "-- ignorar --" não serão importadas.<br>'
+    +     'Campos sem coluna correspondente podem ser preenchidos com um <strong>valor fixo</strong> logo abaixo (ex: "Mercado Pago" no campo Conta).'
+    +   '</div>'
+    +   '<div style="overflow-x:auto;border:1px solid #ddd;border-radius:6px;margin-bottom:15px;max-width:100%;">'
+    +     '<table style="border-collapse:collapse;min-width:100%;">'
+    +       '<thead>'+selectsRow+'</thead>'
+    +       '<tbody>'+previewRows+'</tbody>'
+    +     '</table>'
+    +   '</div>'
+    +   '<div style="margin-bottom:15px;">'
+    +     '<div style="font-weight:bold;margin-bottom:6px;font-size:13px;">🔧 Valores fixos (aplicados a todas as linhas)</div>'
+    +     '<div>'+fixedHtml+'</div>'
+    +   '</div>'
+    +   '<div style="margin-bottom:15px;">'
+    +     '<label style="font-size:13px;cursor:pointer;">'
+    +       '<input type="checkbox" '+(s.inverterSinal?'checked':'')+' onchange="window._importMappingState.inverterSinal=this.checked"> '
+    +       'Inverter sinal dos valores (use quando saídas vêm negativas na planilha)'
+    +     '</label>'
+    +   '</div>'
+    +   '<div style="border-top:1px solid #eee;padding-top:12px;display:flex;gap:10px;justify-content:space-between;flex-wrap:wrap;">'
+    +     '<div>'
+    +       '<button onclick="openSaveImportTemplatePrompt()" style="background:#17a2b8;color:#fff;border:none;padding:9px 16px;border-radius:5px;cursor:pointer;font-size:13px;">💾 Salvar como template</button>'
+    +     '</div>'
+    +     '<div>'
+    +       '<button onclick="closeModal()" style="background:#6c757d;color:#fff;border:none;padding:9px 16px;border-radius:5px;cursor:pointer;font-size:13px;margin-right:6px;">Cancelar</button>'
+    +       '<button onclick="proceedImportMapping()" style="background:#28a745;color:#fff;border:none;padding:9px 22px;border-radius:5px;cursor:pointer;font-size:13px;font-weight:bold;">Continuar →</button>'
+    +     '</div>'
+    +   '</div>'
+    + '</div>';
+
+  openModal('📥 Mapeamento de colunas — '+tipoLabel, body, null, '1150px');
+}
+
+function setImportMappingColumn(idx, field) {
+  var s = window._importMappingState;
+  if (!s) return;
+  if (field) {
+    Object.keys(s.mapping).forEach(function(k) {
+      if (s.mapping[k] === field && String(k) !== String(idx)) delete s.mapping[k];
+    });
+    s.mapping[idx] = field;
+  } else {
+    delete s.mapping[idx];
+  }
+  renderImportMappingUI();
+}
+
+function applyImportTemplate(tplId) {
+  var s = window._importMappingState;
+  if (!s) return;
+  if (!tplId) { s.currentTemplateId = null; renderImportMappingUI(); return; }
+  var tpl = getImportTemplates(s.tipo).find(function(t){return t.id===tplId;});
+  if (!tpl) return;
+  s.mapping = {};
+  s.headers.forEach(function(h, idx) {
+    var field = tpl.headerMapping ? tpl.headerMapping[h] : null;
+    if (field) s.mapping[idx] = field;
+  });
+  s.fixedValues = Object.assign({}, tpl.fixedValues || {});
+  s.inverterSinal = !!tpl.inverterSinal;
+  s.currentTemplateId = tpl.id;
+  renderImportMappingUI();
+}
+
+async function deleteCurrentImportTemplate() {
+  var s = window._importMappingState;
+  if (!s || !s.currentTemplateId) return;
+  if (!confirm('Apagar este template?')) return;
+  await deleteImportTemplate(s.tipo, s.currentTemplateId);
+  s.currentTemplateId = null;
+  renderImportMappingUI();
+  showToast('Template excluído');
+}
+
+function openSaveImportTemplatePrompt() {
+  var s = window._importMappingState;
+  if (!s) return;
+  var existing = s.currentTemplateId ? getImportTemplates(s.tipo).find(function(t){return t.id===s.currentTemplateId;}) : null;
+  var sugName = existing ? existing.nome : '';
+  var nome = prompt('Nome do template:', sugName || 'Meu template');
+  if (!nome) return;
+
+  var headerMapping = {};
+  Object.keys(s.mapping).forEach(function(k) {
+    var idx = parseInt(k);
+    headerMapping[s.headers[idx]] = s.mapping[k];
+  });
+
+  saveImportTemplate(s.tipo, {
+    id: s.currentTemplateId || null,
+    nome: nome,
+    headerMapping: headerMapping,
+    fixedValues: Object.assign({}, s.fixedValues),
+    inverterSinal: s.inverterSinal
+  }).then(function(saved) {
+    s.currentTemplateId = saved.id;
+    renderImportMappingUI();
+    showToast('✅ Template "'+nome+'" salvo!');
+  });
+}
+
+function proceedImportMapping() {
+  var s = window._importMappingState;
+  if (!s) return;
+
+  var mappedFields = Object.values(s.mapping);
+  if (mappedFields.indexOf('valor') === -1) { alert('É obrigatório mapear a coluna de Valor.'); return; }
+  if (mappedFields.indexOf('emissao') === -1 && mappedFields.indexOf('vencimento') === -1) {
+    alert('É obrigatório mapear pelo menos uma coluna de Data (Emissão ou Vencimento).'); return;
+  }
+
+  var dataRows = [];
+  var dataErrors = 0;
+  var negativeSkipped = 0;
+  for (var i = 0; i < s.rows.length; i++) {
+    var row = s.rows[i];
+    var obj = { numero:'', emissao:'', vencimento:'', valor:'', fornecedor:'', conta:'', planoContas:'', centroCusto:'', empresa:'', historico:'', status:'', documento:'', meioPagamento:'' };
+
+    Object.keys(s.mapping).forEach(function(k) {
+      var idx = parseInt(k);
+      var field = s.mapping[k];
+      var raw = row[idx];
+      if (field === 'emissao' || field === 'vencimento') {
+        var d = normDateSmart(raw);
+        if (!d && raw) dataErrors++;
+        obj[field] = d;
+      } else if (field === 'valor') {
+        var n = normMoneyToNumber(raw);
+        if (s.inverterSinal) n = -n;
+        obj[field] = String(n); // mantém sinal; negativo será pulado abaixo
+      } else {
+        obj[field] = String(raw == null ? '' : raw).trim().replace(/^"|"$/g,'');
+      }
+    });
+
+    // aplica valores fixos (só onde não foi mapeado)
+    Object.keys(s.fixedValues).forEach(function(f) {
+      var val = s.fixedValues[f];
+      if (val && !obj[f]) obj[f] = val;
+    });
+
+    // ignora linhas totalmente vazias
+    if (!obj.valor && !obj.fornecedor && !obj.historico && !obj.emissao && !obj.vencimento) continue;
+
+    // pula linhas com valor negativo (são da natureza oposta — ex: saída numa planilha de CR)
+    var valNum = parseFloat(obj.valor);
+    if (!isNaN(valNum) && valNum < 0) { negativeSkipped++; continue; }
+
+    // fallback: se só emissão existe, copia pra vencimento (e vice-versa)
+    if (!obj.vencimento && obj.emissao) obj.vencimento = obj.emissao;
+    if (!obj.emissao && obj.vencimento) obj.emissao = obj.vencimento;
+
+    // em CR, o campo interno 'fornecedor' é chamado 'cliente' pelo confirmImportCR
+    if (s.tipo === 'contas_receber') obj.cliente = obj.fornecedor;
+
+    dataRows.push(obj);
+  }
+
+  if (dataRows.length === 0) {
+    var msg = 'Nenhuma linha válida encontrada após aplicar o mapeamento.';
+    if (negativeSkipped > 0) msg += '\n\n('+negativeSkipped+' linha(s) com valor negativo foram ignoradas — use a tela oposta para importá-las.)';
+    alert(msg);
+    return;
+  }
+
+  window._cpImportData = dataRows;
+  window._crImportData = dataRows;
+  renderImportFinalPreview(s.tipo, dataRows, dataErrors, negativeSkipped);
+}
+
+function renderImportFinalPreview(tipo, dataRows, dateErrors, negativeSkipped) {
+  var nome = tipo === 'contas_pagar' ? 'Contas a Pagar' : 'Contas a Receber';
+  var entityLabel = tipo === 'contas_pagar' ? 'Fornecedor' : 'Cliente';
+  var warnings = '';
+  if (dateErrors && dateErrors > 0) {
+    warnings += '<div style="background:#f8d7da;border-left:4px solid #dc3545;padding:8px 12px;border-radius:4px;margin-bottom:8px;font-size:12px;color:#721c24;">⚠️ '+dateErrors+' valor(es) de data não puderam ser reconhecidos e ficaram vazios. Revise antes de importar.</div>';
+  }
+  if (negativeSkipped && negativeSkipped > 0) {
+    var opposite = tipo === 'contas_pagar' ? 'Contas a Receber' : 'Contas a Pagar';
+    warnings += '<div style="background:#fff3cd;border-left:4px solid #ffc107;padding:8px 12px;border-radius:4px;margin-bottom:8px;font-size:12px;color:#856404;">⚠️ '+negativeSkipped+' linha(s) com valor negativo foram ignoradas. Para importá-las como '+opposite+', marque "Inverter sinal" e use a tela oposta.</div>';
+  }
+  var prev = '<div style="padding:15px;">'
+    + warnings
+    + '<div style="margin-bottom:10px;font-size:13px;">Prévia de <strong>'+dataRows.length+'</strong> lançamentos prontos para importar:</div>'
+    + '<div style="max-height:400px;overflow:auto;border:1px solid #ddd;border-radius:4px;">'
+    + '<table style="width:100%;font-size:11px;border-collapse:collapse;">'
+    + '<thead><tr style="background:#1a5276;color:white;position:sticky;top:0;">'
+    + '<th style="padding:6px;">#</th><th>Número</th><th>Emissão</th><th>Vencimento</th><th>Valor</th><th>'+entityLabel+'</th><th>Conta</th><th>Plano</th><th>Histórico</th></tr></thead><tbody>';
+  dataRows.forEach(function(r,i) {
+    var bg = i%2===0?'#fff':'#f8f9fa';
+    var valorFmt = formatCurrency(parseFloat(r.valor) || 0);
+    prev += '<tr style="background:'+bg+';">'
+      +'<td style="padding:4px;border:1px solid #eee;">'+(i+1)+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.numero||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.emissao||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.vencimento||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;font-weight:bold;">'+valorFmt+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.fornecedor||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.conta||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.planoContas||'')+'</td>'
+      +'<td style="padding:4px;border:1px solid #eee;">'+escapeHtmlImport(r.historico||'')+'</td>'
+      +'</tr>';
+  });
+  prev += '</tbody></table></div>'
+    + '<div style="margin-top:15px;display:flex;gap:10px;justify-content:space-between;">'
+    + '<button onclick="renderImportMappingUI()" style="background:#6c757d;color:#fff;border:none;padding:10px 16px;border-radius:5px;cursor:pointer;">← Voltar ao mapeamento</button>'
+    + '<button onclick="'+(tipo==='contas_pagar'?'confirmImportCP()':'confirmImportCR()')+'" style="background:#28a745;color:#fff;border:none;padding:10px 28px;border-radius:5px;cursor:pointer;font-weight:bold;">✅ IMPORTAR '+dataRows.length+' TÍTULOS</button>'
+    + '</div></div>';
+  openModal('📥 Confirmar importação — '+nome, prev, null, '1150px');
+}
+
+// --- Nova entrada única (substitui o parseCPCSVAndPreview antigo) ---
+function handleCPFileObj(file) {
+  if (!file) return;
+  openImportMappingModal('contas_pagar', file);
 }
 async function confirmImportCP() {
     var dataRows=window._cpImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
@@ -1475,72 +1939,8 @@ function showImportCR() {
   openModal('📥 Importar Contas a Receber via CSV/Excel', body, null, '900px');
 }
 function handleCRFileObj(file) {
-    if(!file) return;
-    var ext = file.name.split('.').pop().toLowerCase();
-    if(ext === 'csv' || ext === 'txt') {
-      var reader=new FileReader();
-      reader.onload=function(e){parseCRCSVAndPreview(e.target.result);};
-      reader.readAsText(file,'UTF-8');
-    } else if(ext === 'xlsx' || ext === 'xls') {
-      loadSheetJS(function(){
-        var reader = new FileReader();
-        reader.onload = function(e) {
-          var wb = XLSX.read(new Uint8Array(e.target.result), {type:'array', cellDates:true});
-          var rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, defval:''});
-          var csv = rows.map(function(r){ return r.join(';'); }).join('\n');
-          parseCRCSVAndPreview(csv);
-        };
-        reader.readAsArrayBuffer(file);
-      });
-    } else {
-      alert('Formato n\u00e3o suportado. Use .csv, .txt, .xlsx ou .xls');
-    }
-    }function parseCRCSVAndPreview(csvText) {
-  var lines=csvText.split(/\r?\n/).filter(function(l){return l.trim();});
-  if(lines.length<2){alert('Arquivo vazio');return;}
-  var firstLine=lines[0].replace(/^\uFEFF/,'');
-  var sep=(firstLine.split(';').length>firstLine.split(',').length)?';':',';
-  var headers=firstLine.split(sep).map(function(h){return h.trim().replace(/^"|"$/g,'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');});
-  // Mapping ampliado: 'data' mapeia para vencimento E emissão, 'valor (r$)' mapeia para valor, 'tipo' para historico, 'dia da semana' ignorado
-  var mapping={numero:['numero','num'],emissao:['emissao','data_emissao'],vencimento:['vencimento','data'],valor:['valor'],cliente:['cliente','customer','pessoa'],conta:['conta','banco'],planoContas:['plano_contas','plano','categoria'],centroCusto:['centro_custo','centro'],empresa:['empresa'],documento:['documento','doc'],meioPagamento:['meio_pagamento','meio'],historico:['historico','descricao','tipo'],status:['status','situacao']};
-  var colMap={};
-  headers.forEach(function(h,i){
-    // Normalizar header removendo parênteses e conteúdo extra
-    var hClean = h.replace(/\(.*?\)/g,'').trim();
-    for(var field in mapping){
-      if(mapping[field].some(function(a){return h.includes(a) || hClean.includes(a);})){
-        colMap[field]=i;break;
-      }
-    }
-  });
-  // Se não encontrou 'vencimento' mas encontrou coluna 'data', usar 'data' como vencimento
-  if(colMap.vencimento===undefined){
-    headers.forEach(function(h,i){ if(h==='data' && colMap.vencimento===undefined) colMap.vencimento=i; });
-  }
-  // Se não encontrou emissão, usar mesmo índice de vencimento
-  if(colMap.emissao===undefined && colMap.vencimento!==undefined) colMap.emissao=colMap.vencimento;
-
-  var dataRows=[];
-  var skippedNeg=0;
-  for(var i=1;i<lines.length;i++){
-    var cols=lines[i].split(sep).map(function(c){return c.trim().replace(/^"|"$/g,'');});
-    if(cols.length<2) continue;
-    var row={};
-    for(var field in colMap){row[field]=cols[colMap[field]]||'';}
-    // Tratar valores negativos (são "A Pagar", não "A Receber") - pular ou avisar
-    var rawVal = row.valor || '';
-    var numVal = parseFloat(rawVal.replace(/[R$\s.]/g,'').replace(',','.'));
-    if(!isNaN(numVal) && numVal < 0){ skippedNeg++; continue; }
-    dataRows.push(row);
-  }
-  if(dataRows.length===0){alert('Nenhum dado encontrado'+(skippedNeg>0?' ('+skippedNeg+' linhas com valor negativo foram ignoradas por serem "A Pagar")':'')); return;}
-  window._crImportData=dataRows;
-  window._crImportSkipped=skippedNeg;
-  var prev='<table style="width:100%;font-size:11px;border-collapse:collapse;"><thead><tr style="background:#1a5276;color:white;"><th style="padding:4px;">Vencimento</th><th>Valor</th><th>Cliente</th><th>Histórico</th><th>Número</th><th>Conta</th><th>Plano</th></tr></thead><tbody>';
-  dataRows.forEach(function(r,i){var bg=i%2===0?'#fff':'#f8f9fa';prev+='<tr style="background:'+bg+';"><td style="padding:3px;border:1px solid #ddd;font-weight:bold;">'+(r.vencimento||'')+'</td><td style="padding:3px;border:1px solid #ddd;color:#28a745;font-weight:bold;">'+(r.valor||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.cliente||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.historico||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.numero||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.conta||'')+'</td><td style="padding:3px;border:1px solid #ddd;">'+(r.planoContas||'')+'</td></tr>';});
-  prev+='</tbody></table>';
-  var skipMsg = skippedNeg>0 ? '<div style="margin-top:8px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:12px;color:#856404;">⚠️ '+skippedNeg+' linha(s) com valor negativo ("A Pagar") foram ignoradas. Para importá-las, use a tela de Contas a Pagar.</div>' : '';
-  document.getElementById('cr-import-preview').innerHTML='<div style="max-height:300px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">'+prev+'</div>'+skipMsg+'<div style="margin-top:12px;text-align:center;"><button style="background:#28a745;color:white;border:none;padding:10px 30px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;" onclick="confirmImportCR()">✅ IMPORTAR '+dataRows.length+' TÍTULOS</button></div>';
+  if (!file) return;
+  openImportMappingModal('contas_receber', file);
 }
 async function confirmImportCR() {
     var dataRows=window._crImportData;if(!dataRows||dataRows.length===0){alert('Nenhum dado');return;}
