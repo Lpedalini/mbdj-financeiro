@@ -2930,7 +2930,7 @@ function renderFluxoCaixa() {
     '<div><label>Status:</label><select id="fc-status"><option value="Ambos">Ambos</option><option value="Abertos">Abertos</option><option value="Liquidados">Liquidados</option></select></div>'+
     '<div><label>Conta:</label><select id="fc-conta" onchange="fcContaChange()"><option value="">Todas</option>'+contasOpts+'</select></div></div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
-    '<div style="background:#e8f5e9;padding:8px 12px;border-radius:6px;border:1px solid #c3e6cb;"><label style="color:#155724;font-weight:bold;display:flex;align-items:center;gap:5px;">💰 Saldo Inicial do Período: <span style="cursor:help;color:#155724;opacity:0.7;font-weight:normal;" title="Calculado automaticamente com base na data inicial:&#10;&#10;• Data = HOJE → saldo atual cadastrado nas Contas Bancárias&#10;• Data FUTURA → saldo de hoje + CR/projeções abertas − CP abertas (até um dia antes da data filtrada)&#10;• Data PASSADA → saldo de hoje recuado no tempo usando liquidados&#10;&#10;Você pode editar o valor manualmente se precisar de uma simulação.">❓</span></label><input type="text" id="fc-saldo-ini" value="'+formatCurrency(saldoPadrao)+'" style="width:100%;padding:6px 8px;border:1px solid #28a745;border-radius:4px;font-size:13px;font-weight:bold;color:#155724;background:white;margin-top:3px;"></div>'+
+    '<div style="background:#e8f5e9;padding:8px 12px;border-radius:6px;border:1px solid #c3e6cb;"><label style="color:#155724;font-weight:bold;display:flex;align-items:center;gap:5px;">💰 Saldo Inicial do Período: <span style="cursor:help;color:#155724;opacity:0.7;font-weight:normal;" title="Calculado automaticamente com base na data inicial:&#10;&#10;• Data = HOJE → saldo atual cadastrado nas Contas Bancárias&#10;• Data FUTURA → saldo de hoje + CR/projeções abertas − CP abertas (até um dia antes da data filtrada)&#10;• Data PASSADA → saldo de hoje recuado no tempo usando liquidados&#10;&#10;Você pode editar o valor manualmente se precisar de uma simulação.">❓</span></label><input type="text" id="fc-saldo-ini" value="'+formatCurrency(saldoPadrao)+'" autocomplete="off" autocomplete="new-password" name="fc-saldo-ini-'+Date.now()+'" data-lpignore="true" data-form-type="other" style="width:100%;padding:6px 8px;border:1px solid #28a745;border-radius:4px;font-size:13px;font-weight:bold;color:#155724;background:white;margin-top:3px;"></div>'+
     '<div style="display:flex;align-items:flex-end;"><button style="background:#6c757d;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="fcResetSaldo()" title="Recalcula o saldo inicial automaticamente conforme data e conta selecionadas">🔄 Recalcular saldo</button></div>'+
     '<div style="display:flex;align-items:flex-end;"><label style="font-size:11px;"><input type="checkbox" id="fc-show-proj" checked onchange="pesquisarFC()" style="margin-right:4px;">Incluir projeções no fluxo</label></div></div>'+
     '<div style="display:flex;gap:8px;"><button class="btn-secondary" onclick="limparFiltrosFC()">Limpar</button><button class="btn-primary" onclick="pesquisarFC()">Pesquisar</button>'+
@@ -2954,6 +2954,19 @@ function renderFluxoCaixa() {
   renderProjecoesList();
   _restoreFilters('fluxo-caixa');
   pesquisarFC();
+  // Proteção contra autofill do Chrome/gerenciadores de senha:
+  // recalcula e sobrescreve o campo depois que o navegador tenha preenchido
+  setTimeout(function(){
+    var el = document.getElementById('fc-saldo-ini');
+    if(!el) return;
+    var de = document.getElementById('fc-de').value;
+    var ctF = document.getElementById('fc-conta').value;
+    var correto = formatCurrency(calcSaldoInicialNaData(de, ctF));
+    if(el.value !== correto) {
+      el.value = correto;
+      pesquisarFC();
+    }
+  }, 300);
 }
 
 function renderProjecoesList() {
@@ -6739,6 +6752,7 @@ async function renderSefazSyncDashboard() {
 }
 
 
+var _sefazFunctions = null;
 function getSefazFunctions() {
   if(!_sefazFunctions) {
     _sefazFunctions = {
