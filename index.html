@@ -222,7 +222,6 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); line-he
     <a href="#" onclick="showSection('creditos-trib')" id="menu-creditos-trib">🧾 Créditos Tributários</a>
     <a href="#" onclick="showSection('fechamento')" id="menu-fechamento">📊 Fechamento Mensal</a>
     <a href="#" onclick="showSection('conciliacao')" id="menu-conciliacao">🔄 Conciliação NF-e</a>
-    <a href="https://www.nfe.fazenda.gov.br/portal/consultaRecebidas.aspx" target="_blank" style="color:#888;font-size:11px;">🔗 Portal SEFAZ ↗</a>
   </div>
   <div class="section-title" onclick="toggleMenu(this)">📦 Estoque <span class="menu-arrow">▶</span></div>
   <div class="menu-group">
@@ -747,15 +746,57 @@ function getDatePlusMonths(m) {
   var last = new Date(d.getFullYear(), d.getMonth()+1, 0);
   return last.toISOString().split('T')[0];
 }
-function calcSaldoAtual() {
+// Retorna o saldo atual das contas bancárias (soma dos saldos cadastrados)
+// — opcionalmente filtrado por uma conta específica.
+// Obs: os saldos cadastrados em Contas Bancárias já refletem o saldo real
+// de HOJE, portanto não somamos liquidações passadas (senão duplicaria).
+function calcSaldoAtual(contaFiltro) {
   var contas = getData('contas_bancarias');
-  var saldoIni = contas.reduce(function(s,c){ return s+parseCurrency(c.saldoInicial||'0'); },0);
+  if (contaFiltro) contas = contas.filter(function(c){ return c.nome === contaFiltro; });
+  return contas.reduce(function(s,c){ return s+parseCurrency(c.saldoInicial||'0'); }, 0);
+}
+
+// Calcula o saldo inicial a ser usado como "partida" do Fluxo de Caixa
+// de acordo com a data informada:
+//   - data == hoje : saldo atual das contas
+//   - data > hoje  : saldo de hoje + CR/projeções em aberto (hoje→data-1) − CP em aberto
+//   - data < hoje  : saldo de hoje recuado, usando liquidados entre data→hoje-1
+function calcSaldoInicialNaData(dataIni, contaFiltro) {
+  var saldoHoje = calcSaldoAtual(contaFiltro);
+  if (!dataIni) return saldoHoje;
   var today = getToday();
-  var cpLiq = getData('contas_pagar').filter(function(i){ return i.status==='Liquidado' && i.vencimento<=today; });
-  var crLiq = getData('contas_receber').filter(function(i){ return i.status==='Liquidado' && i.vencimento<=today; });
-  var totalPago = cpLiq.reduce(function(s,i){ return s+parseCurrency(i.valor); },0);
-  var totalRecebido = crLiq.reduce(function(s,i){ return s+parseCurrency(i.valor); },0);
-  return saldoIni + totalRecebido - totalPago;
+  if (dataIni === today) return saldoHoje;
+
+  var filtrarConta = function(i){ return !contaFiltro || i.conta === contaFiltro; };
+
+  if (dataIni > today) {
+    // FUTURO — projetar movimentações em aberto entre hoje e dataIni-1 (exclusivo)
+    var cp = getData('contas_pagar').filter(function(i){
+      return i.status === 'Aberto' && i.vencimento >= today && i.vencimento < dataIni && filtrarConta(i);
+    });
+    var cr = getData('contas_receber').filter(function(i){
+      return i.status === 'Aberto' && i.vencimento >= today && i.vencimento < dataIni && filtrarConta(i);
+    });
+    var proj = getData('projecoes_fc').filter(function(i){
+      return i.data >= today && i.data < dataIni;
+    });
+    var entradas = cr.reduce(function(s,i){ return s+parseCurrency(i.valor); }, 0)
+                 + proj.reduce(function(s,i){ return s+parseCurrency(i.valor); }, 0);
+    var saidas   = cp.reduce(function(s,i){ return s+parseCurrency(i.valor); }, 0);
+    return saldoHoje + entradas - saidas;
+  }
+
+  // PASSADO — recuar no tempo usando apenas liquidados entre dataIni e hoje-1 (exclusivo)
+  var cpLiq = getData('contas_pagar').filter(function(i){
+    return i.status === 'Liquidado' && i.vencimento >= dataIni && i.vencimento < today && filtrarConta(i);
+  });
+  var crLiq = getData('contas_receber').filter(function(i){
+    return i.status === 'Liquidado' && i.vencimento >= dataIni && i.vencimento < today && filtrarConta(i);
+  });
+  var entradasRetro = crLiq.reduce(function(s,i){ return s+parseCurrency(i.valor); }, 0);
+  var saidasRetro   = cpLiq.reduce(function(s,i){ return s+parseCurrency(i.valor); }, 0);
+  // saldo(dataIni) = saldo(hoje) - entradas ocorridas depois + saídas ocorridas depois
+  return saldoHoje - entradasRetro + saidasRetro;
 }
 
 // === MODAL ===
@@ -2089,7 +2130,8 @@ function renderNFe() {
   allNfes.forEach(function(nfe){ _getNfeCfops(nfe).forEach(function(c){ allCfops[c]=true; }); });
   var cfopKeys=Object.keys(allCfops).sort();
   var cfopOpts=cfopKeys.map(function(c){ var t=_getCfopTipo(c); return '<option value="'+c+'">'+c+(t?' ('+t+')':'')+'</option>'; }).join('');
-  content.innerHTML='<div class="filter-panel"><h3>🔍 Nota Fiscal Eletrônica</h3>'+
+  content.innerHTML='<div id="sefaz-sync-dashboard" style="margin-bottom:12px;"><div style="background:#f0f4f8;border:1px solid #d5dde5;border-radius:6px;padding:10px 14px;font-size:12px;color:#555;">⏳ Carregando status da sincronização...</div></div>'+
+    '<div class="filter-panel"><h3>🔍 Nota Fiscal Eletrônica</h3>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
     '<div><label>Emissão de:</label><input type="date" id="nfe-de"></div>'+
     '<div><label>Emissão até:</label><input type="date" id="nfe-ate"></div>'+
@@ -2103,6 +2145,7 @@ function renderNFe() {
     '<div id="nfe-results"></div>';
   _restoreFilters('notas-fiscais');
   pesquisarNFe();
+  renderSefazSyncDashboard();
 }
 function pesquisarNFe() {
   _saveFilters('notas-fiscais');
@@ -2162,6 +2205,7 @@ function pesquisarNFe() {
   '<div class="action-bar"><div class="left"><button class="btn-primary" onclick="criarNFe()">+ NOVA NF-e</button><button style="background:#28a745;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="showImportXML()">📥 IMPORTAR XML</button>'+
     '<span style="color:#ccc;font-size:11px;">|</span>'+
     '<button id="btn-sync-sefaz" style="background:#1a5276;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="sincronizarSefaz()">🔄 SINCRONIZAR SEFAZ</button>'+
+    '<button style="background:#8e44ad;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;" onclick="showBuscarNFePorChave()">🔍 BUSCAR POR CHAVE</button>'+
     '<button style="background:#6c757d;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="showConfigSefaz()">⚙️ Config SEFAZ</button>'+
   '</div><div class="right">'+items.length+' itens</div></div>';
 }
@@ -2877,16 +2921,17 @@ function renderFluxoCaixa() {
   var content=document.getElementById('main-content');
   var contas=getData('contas_bancarias');
   var contasOpts=contas.map(function(c){return '<option value="'+c.nome+'">'+c.nome+'</option>';}).join('');
-  var saldoPadrao = calcSaldoAtual();
+  var deInicial = getFirstDayPrevMonth();
+  var saldoPadrao = calcSaldoInicialNaData(deInicial, '');
   content.innerHTML='<div class="filter-panel"><h3>📊 Fluxo de Caixa</h3>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
-    '<div><label>Período de:</label><input type="date" id="fc-de" value="'+getFirstDayPrevMonth()+'"></div>'+
+    '<div><label>Período de:</label><input type="date" id="fc-de" value="'+deInicial+'" onchange="fcDateChange()"></div>'+
     '<div><label>Período até:</label><input type="date" id="fc-ate" value="'+getDatePlusMonths(3)+'"></div>'+
     '<div><label>Status:</label><select id="fc-status"><option value="Ambos">Ambos</option><option value="Abertos">Abertos</option><option value="Liquidados">Liquidados</option></select></div>'+
     '<div><label>Conta:</label><select id="fc-conta" onchange="fcContaChange()"><option value="">Todas</option>'+contasOpts+'</select></div></div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;">'+
-    '<div style="background:#e8f5e9;padding:8px 12px;border-radius:6px;border:1px solid #c3e6cb;"><label style="color:#155724;font-weight:bold;">💰 Saldo Inicial do Período:</label><input type="text" id="fc-saldo-ini" value="'+formatCurrency(saldoPadrao)+'" style="width:100%;padding:6px 8px;border:1px solid #28a745;border-radius:4px;font-size:13px;font-weight:bold;color:#155724;background:white;margin-top:3px;"></div>'+
-    '<div style="display:flex;align-items:flex-end;"><button style="background:#6c757d;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="fcResetSaldo()" title="Restaurar saldo das contas bancárias">🔄 Restaurar saldo</button></div>'+
+    '<div style="background:#e8f5e9;padding:8px 12px;border-radius:6px;border:1px solid #c3e6cb;"><label style="color:#155724;font-weight:bold;display:flex;align-items:center;gap:5px;">💰 Saldo Inicial do Período: <span style="cursor:help;color:#155724;opacity:0.7;font-weight:normal;" title="Calculado automaticamente com base na data inicial:&#10;&#10;• Data = HOJE → saldo atual cadastrado nas Contas Bancárias&#10;• Data FUTURA → saldo de hoje + CR/projeções abertas − CP abertas (até um dia antes da data filtrada)&#10;• Data PASSADA → saldo de hoje recuado no tempo usando liquidados&#10;&#10;Você pode editar o valor manualmente se precisar de uma simulação.">❓</span></label><input type="text" id="fc-saldo-ini" value="'+formatCurrency(saldoPadrao)+'" style="width:100%;padding:6px 8px;border:1px solid #28a745;border-radius:4px;font-size:13px;font-weight:bold;color:#155724;background:white;margin-top:3px;"></div>'+
+    '<div style="display:flex;align-items:flex-end;"><button style="background:#6c757d;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;" onclick="fcResetSaldo()" title="Recalcula o saldo inicial automaticamente conforme data e conta selecionadas">🔄 Recalcular saldo</button></div>'+
     '<div style="display:flex;align-items:flex-end;"><label style="font-size:11px;"><input type="checkbox" id="fc-show-proj" checked onchange="pesquisarFC()" style="margin-right:4px;">Incluir projeções no fluxo</label></div></div>'+
     '<div style="display:flex;gap:8px;"><button class="btn-secondary" onclick="limparFiltrosFC()">Limpar</button><button class="btn-primary" onclick="pesquisarFC()">Pesquisar</button>'+
     '<button style="background:#17a2b8;color:white;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;" onclick="exportarFC()">📤 EXPORTAR EXCEL</button></div></div>'+
@@ -2988,17 +3033,16 @@ function clearAllProjecoes() {
 }
 function fcContaChange() {
   var ctF = document.getElementById('fc-conta').value;
-  if(!ctF) {
-    document.getElementById('fc-saldo-ini').value = formatCurrency(calcSaldoAtual());
-  } else {
-    var contas = getData('contas_bancarias').filter(function(b){return b.nome===ctF;});
-    var saldo = contas.reduce(function(s,b){ return s+parseCurrency(b.saldoInicial||'0'); },0);
-    document.getElementById('fc-saldo-ini').value = formatCurrency(saldo);
-  }
+  var de  = document.getElementById('fc-de').value;
+  document.getElementById('fc-saldo-ini').value = formatCurrency(calcSaldoInicialNaData(de, ctF));
+}
+function fcDateChange() {
+  // Recalcula o saldo inicial quando a data de início muda
+  fcContaChange();
 }
 function fcResetSaldo() {
   fcContaChange();
-  showToast('Saldo restaurado das contas bancárias.');
+  showToast('🔄 Saldo inicial recalculado conforme data e conta.');
 }
 function limparFiltrosFC(){document.getElementById('fc-de').value=getFirstDayPrevMonth();document.getElementById('fc-ate').value=getDatePlusMonths(3);document.getElementById('fc-status').value='Ambos';document.getElementById('fc-conta').value='';fcContaChange();pesquisarFC();}
 
@@ -6607,16 +6651,212 @@ function baixarModeloEstoqueCSV() {
 // ============================================================
 
 // Inicializar Firebase Functions callable
-var _sefazFunctions = null;
+// ============================================================
+// === DASHBOARD DE STATUS DA SINCRONIZAÇÃO SEFAZ ===
+// ============================================================
+async function renderSefazSyncDashboard() {
+  var el = document.getElementById('sefaz-sync-dashboard');
+  if(!el) return;
+
+  try {
+    var doc = await db.collection('config').doc('sefaz_sync').get();
+    if(!doc.exists) {
+      el.innerHTML = '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;font-size:12px;color:#856404;">📡 Sincronização SEFAZ ainda não foi executada. Clique em "🔄 SINCRONIZAR SEFAZ" para começar.</div>';
+      return;
+    }
+    var d = doc.data() || {};
+    var ult = d.ultimaSincronizacao;
+    var r = d.ultimoResultado || {};
+    var erroAg = d.ultimoErroAgendado || null;
+    var origem = d.ultimaOrigem || '';
+
+    var agoraStr = '-';
+    var diffMin = null;
+    if(ult) {
+      var dt = new Date(ult);
+      diffMin = Math.floor((Date.now() - dt.getTime()) / 60000);
+      var diffH = Math.floor(diffMin/60);
+      var diffD = Math.floor(diffH/24);
+      if(diffMin < 1) agoraStr = 'agora mesmo';
+      else if(diffMin < 60) agoraStr = 'há '+diffMin+' min';
+      else if(diffH < 24) agoraStr = 'há '+diffH+'h';
+      else agoraStr = 'há '+diffD+' dia(s)';
+      agoraStr += ' · '+dt.toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    }
+
+    // Cor do card conforme frescor da sincronização
+    var corBarra = '#10B981'; // verde
+    var statusMsg = '✅ Sincronização em dia';
+    if(diffMin === null) { corBarra = '#F59E0B'; statusMsg = '⚠️ Status desconhecido'; }
+    else if(diffMin > 720) { corBarra = '#F59E0B'; statusMsg = '⚠️ Sincronização atrasada'; }
+    else if(diffMin > 1440) { corBarra = '#EF4444'; statusMsg = '🔴 Sincronização muito atrasada'; }
+
+    // Chip de origem: manual ou cron
+    var origemChip = '';
+    if(origem === 'cron') origemChip = '<span style="background:#e7f3ff;color:#1a5276;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;">🤖 automática</span>';
+    else if(origem && origem.startsWith('manual')) origemChip = '<span style="background:#f0e7fc;color:#6c3baa;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;">👤 manual</span>';
+
+    var orfaosMsg = '';
+    if(r.resumosOrfaosPendentes && r.resumosOrfaosPendentes > 0) {
+      orfaosMsg = '<div style="margin-top:6px;padding:6px 10px;background:#fff3cd;border-left:3px solid #ffc107;border-radius:3px;font-size:11px;color:#856404;">⚠️ '+r.resumosOrfaosPendentes+' nota(s) em estado intermediário — serão retomadas na próxima sync.</div>';
+    }
+    var orfaosRecuperadosMsg = '';
+    if(r.orfaosReprocessados && r.orfaosReprocessados > 0) {
+      orfaosRecuperadosMsg = ' · <strong style="color:#17a2b8">+'+r.orfaosReprocessados+' recuperada(s) de sync anterior</strong>';
+    }
+    var rateLimitMsg = '';
+    if(r.rateLimited) {
+      rateLimitMsg = '<div style="margin-top:6px;padding:6px 10px;background:#fff3cd;border-left:3px solid #ffc107;border-radius:3px;font-size:11px;color:#856404;">⚠️ Última sync parou por limite de consultas da SEFAZ. Próxima rodada vai continuar de onde parou.</div>';
+    }
+    var erroMsg = '';
+    if(erroAg) {
+      var dtErro = new Date(erroAg.ocorridoEm).toLocaleString('pt-BR');
+      erroMsg = '<div style="margin-top:6px;padding:6px 10px;background:#f8d7da;border-left:3px solid #dc3545;border-radius:3px;font-size:11px;color:#721c24;">🔴 Sync automática com erro em '+dtErro+': '+escapeHtmlImport(erroAg.mensagem)+'</div>';
+    }
+
+    var totalNFe = r.totalNFe || 0;
+    var duracao = r.duracaoSegundos || '-';
+
+    el.innerHTML = '<div style="background:#fff;border:1px solid #d5dde5;border-left:4px solid '+corBarra+';border-radius:6px;padding:10px 14px;font-size:12px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">'
+      +   '<div style="flex:1;min-width:180px;">'
+      +     '<div style="font-weight:700;color:'+corBarra+';margin-bottom:3px;">'+statusMsg+' '+origemChip+'</div>'
+      +     '<div style="color:#666;font-size:11px;">Última sync: '+agoraStr+'</div>'
+      +   '</div>'
+      +   '<div style="text-align:right;">'
+      +     '<div style="font-size:11px;color:#666;">Última execução:</div>'
+      +     '<div style="font-size:12px;"><strong>'+totalNFe+'</strong> NFe · '+duracao+'s'+orfaosRecuperadosMsg+'</div>'
+      +   '</div>'
+      + '</div>'
+      + orfaosMsg + rateLimitMsg + erroMsg
+      + '<div style="margin-top:6px;font-size:10px;color:#999;">🤖 Sincronização automática rodando 2x ao dia (7h e 19h). Você pode forçar manual clicando no botão abaixo.</div>'
+      + '</div>';
+
+  } catch(e) {
+    console.error('renderSefazSyncDashboard:', e);
+    el.innerHTML = '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:10px 14px;font-size:12px;color:#721c24;">❌ Erro ao carregar status da sincronização: '+(e.message||e)+'</div>';
+  }
+}
+
+
 function getSefazFunctions() {
   if(!_sefazFunctions) {
     _sefazFunctions = {
       sincronizar: firebase.functions().httpsCallable('sincronizarSefaz'),
       uploadCert:  firebase.functions().httpsCallable('uploadCertificado'),
-      status:      firebase.functions().httpsCallable('statusSefaz')
+      status:      firebase.functions().httpsCallable('statusSefaz'),
+      buscarPorChave: firebase.functions().httpsCallable('buscarNFePorChave')
     };
   }
   return _sefazFunctions;
+}
+
+// ============================================================
+// === BUSCAR NF-e POR CHAVE (recupera notas perdidas) ===
+// ============================================================
+function showBuscarNFePorChave() {
+  var body = '<div style="padding:20px;">'
+    + '<div style="background:#f8f4fc;border-left:4px solid #8e44ad;padding:12px 16px;border-radius:4px;margin-bottom:16px;font-size:13px;line-height:1.5;">'
+    +   '<strong>🔍 Buscar NF-e por chave</strong><br>'
+    +   'Use quando uma nota fiscal emitida contra seu CNPJ <strong>não apareceu</strong> na sincronização normal. '
+    +   'Com a chave de 44 dígitos, o sistema consulta a SEFAZ diretamente e importa a nota.'
+    + '</div>'
+    + '<label style="display:block;font-size:12px;color:#555;margin-bottom:5px;font-weight:600;">Chave da NF-e (44 dígitos)</label>'
+    + '<input type="text" id="bnc-chave" placeholder="Cole aqui a chave de acesso de 44 dígitos" '
+    +   'style="width:100%;padding:10px 12px;border:1px solid #ccc;border-radius:4px;font-family:monospace;font-size:13px;letter-spacing:0.5px;" '
+    +   'oninput="bncValidateInput()" onpaste="setTimeout(bncValidateInput,10)">'
+    + '<div id="bnc-count" style="font-size:11px;color:#888;margin-top:4px;text-align:right;">0 / 44 dígitos</div>'
+    + '<div style="font-size:11px;color:#666;margin-top:6px;">💡 Pontos, espaços e traços são ignorados automaticamente. Ex: <code>35240361310256000190550010...</code></div>'
+    + '<div id="bnc-result" style="margin-top:18px;"></div>'
+    + '<div style="margin-top:20px;border-top:1px solid #eee;padding-top:14px;display:flex;justify-content:flex-end;gap:10px;">'
+    +   '<button onclick="closeModal()" style="background:#6c757d;color:#fff;border:none;padding:9px 16px;border-radius:5px;cursor:pointer;">Cancelar</button>'
+    +   '<button id="bnc-btn" onclick="executarBuscarNFePorChave()" style="background:#8e44ad;color:#fff;border:none;padding:9px 24px;border-radius:5px;cursor:pointer;font-weight:bold;">🔍 Buscar na SEFAZ</button>'
+    + '</div>'
+    + '</div>';
+  openModal('🔍 Buscar NF-e por Chave', body, null, '700px');
+  setTimeout(function(){ var i=document.getElementById('bnc-chave'); if(i) i.focus(); }, 50);
+}
+
+function bncValidateInput() {
+  var input = document.getElementById('bnc-chave');
+  var count = document.getElementById('bnc-count');
+  if(!input || !count) return;
+  var digits = (input.value || '').replace(/\D/g,'');
+  count.textContent = digits.length + ' / 44 dígitos';
+  count.style.color = digits.length === 44 ? '#28a745' : (digits.length > 44 ? '#dc3545' : '#888');
+}
+
+async function executarBuscarNFePorChave() {
+  var input = document.getElementById('bnc-chave');
+  var resultDiv = document.getElementById('bnc-result');
+  var btn = document.getElementById('bnc-btn');
+  if(!input) return;
+
+  var chave = (input.value || '').replace(/\D/g,'');
+  if(chave.length !== 44) {
+    resultDiv.innerHTML = '<div style="background:#f8d7da;border-left:4px solid #dc3545;padding:10px 14px;border-radius:4px;font-size:13px;color:#721c24;">❌ A chave precisa ter exatamente 44 dígitos. Você digitou '+chave.length+'.</div>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '⏳ Consultando SEFAZ...';
+  resultDiv.innerHTML = '<div style="background:#fffbea;border-left:4px solid #f39c12;padding:10px 14px;border-radius:4px;font-size:13px;">🔄 Conectando à SEFAZ... Isso pode levar até 30 segundos.</div>';
+
+  try {
+    // Verifica certificado antes
+    var fns = getSefazFunctions();
+    var statusRes = await fns.status();
+    if(!statusRes.data || !statusRes.data.certificadoConfigurado) {
+      resultDiv.innerHTML = '<div style="background:#f8d7da;border-left:4px solid #dc3545;padding:10px 14px;border-radius:4px;font-size:13px;color:#721c24;">⚠️ Certificado A1 não configurado. Vá em "Config SEFAZ" antes de buscar.</div>';
+      btn.disabled = false;
+      btn.innerHTML = '🔍 Buscar na SEFAZ';
+      return;
+    }
+
+    var res = await fns.buscarPorChave({ chave: chave });
+    var data = res.data;
+
+    if(data.success && !data.jaExistia) {
+      // Sucesso — nota importada
+      resultDiv.innerHTML = '<div style="background:#d4edda;border-left:4px solid #28a745;padding:14px 18px;border-radius:4px;font-size:13px;color:#155724;">'
+        + '<div style="font-size:15px;font-weight:bold;margin-bottom:8px;">✅ NF-e importada com sucesso!</div>'
+        + '<div><strong>Número:</strong> '+(data.numero||'-')+' / Série '+(data.serie||'-')+'</div>'
+        + '<div><strong>Emissão:</strong> '+(data.emissao||'-')+'</div>'
+        + '<div><strong>Fornecedor:</strong> '+(data.fornecedor||'-')+'</div>'
+        + '<div><strong>CNPJ:</strong> '+(data.cnpj||'-')+'</div>'
+        + '<div><strong>Valor:</strong> '+(data.valor||'-')+'</div>'
+        + '<div style="margin-top:8px;font-size:11px;color:#666;">Tempo: '+(data.duracaoSegundos||'-')+'s</div>'
+        + '</div>';
+      showToast('✅ NF-e '+data.numero+' importada!');
+      // Recarrega dados e atualiza listagem
+      setTimeout(async function(){
+        try { await loadAllDataFromFirestore(); pesquisarNFe(); renderSefazSyncDashboard(); } catch(_){}
+      }, 500);
+    } else if(data.success && data.jaExistia) {
+      resultDiv.innerHTML = '<div style="background:#d1ecf1;border-left:4px solid #17a2b8;padding:14px 18px;border-radius:4px;font-size:13px;color:#0c5460;">'
+        + '<div style="font-weight:bold;margin-bottom:6px;">ℹ️ NF-e já está no sistema</div>'
+        + '<div>A nota '+(data.numero||'-')+' já havia sido importada anteriormente. Nenhuma ação necessária.</div>'
+        + '</div>';
+    } else {
+      // Falhou — mostra mensagem do backend
+      resultDiv.innerHTML = '<div style="background:#f8d7da;border-left:4px solid #dc3545;padding:14px 18px;border-radius:4px;font-size:13px;color:#721c24;">'
+        + '<div style="font-weight:bold;margin-bottom:6px;">❌ Não foi possível importar</div>'
+        + '<div>'+(data.msg || 'Erro desconhecido')+'</div>'
+        + (data.cStat ? '<div style="margin-top:6px;font-size:11px;color:#666;">Código SEFAZ: '+data.cStat+' — '+(data.xMotivo||'')+'</div>' : '')
+        + '</div>';
+    }
+
+  } catch(e) {
+    console.error('buscarNFePorChave:', e);
+    var msg = e.message || 'Erro desconhecido';
+    if(msg.includes('resource-exhausted')) msg = 'SEFAZ bloqueou por excesso de consultas. Aguarde ~5 minutos e tente de novo.';
+    else if(msg.includes('unauthenticated')) msg = 'Sessão expirada. Faça login novamente.';
+    else if(msg.includes('not-found') || msg.includes('not a function')) msg = 'Cloud Function "buscarNFePorChave" não encontrada. Faça deploy das functions.';
+    resultDiv.innerHTML = '<div style="background:#f8d7da;border-left:4px solid #dc3545;padding:14px 18px;border-radius:4px;font-size:13px;color:#721c24;"><strong>❌ Erro:</strong> '+msg+'</div>';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '🔍 Buscar na SEFAZ';
+  }
 }
 
 async function sincronizarSefaz() {
@@ -6650,6 +6890,8 @@ async function sincronizarSefaz() {
         await loadAllDataFromFirestore();
         pesquisarNFe(); // Atualizar listagem
       }
+      // Atualiza painel de status em qualquer caso
+      renderSefazSyncDashboard();
     } else {
       showToast('❌ Erro na sincronização: ' + (data.msg || 'Erro desconhecido'), true);
     }
