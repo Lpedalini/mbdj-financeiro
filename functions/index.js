@@ -44,7 +44,7 @@ const CONFIG = {
   AMBIENTE: "1",
   URL_PROD: "https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
   URL_HOMOLOG: "https://hom1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
-  MAX_ITERATIONS: 10,
+  MAX_ITERATIONS: 30,
   RATE_LIMIT_MS: 1500,
   RETRY_MAX: 2,
   RETRY_DELAY_MS: 3000,
@@ -462,99 +462,363 @@ function getTagTextNS(parent, ns, tagName) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  CLOUD FUNCTION: sincronizarSefaz
+//  HELPER: reprocessar resumos órfãos (coleção sefaz_resumos)
+//  Quando uma NFe vem como resumo da SEFAZ e a 2ª chamada
+//  (consChNFe) falha, o documento cai em sefaz_resumos e fica
+//  esquecido. Esta função tenta novamente a busca e, se der
+//  certo, salva como NFe completa e limpa o resumo órfão.
+// ══════════════════════════════════════════════════════════
+async function reprocessarResumosOrfaos() {
+  const orfaos = [];
+  const resultado = { total: 0, recuperadas: 0, aindaFalhando: 0, detalhes: [] };
+
+  try {
+    const snapshot = await db.collection("sefaz_resumos").get();
+    snapshot.forEach(d => orfaos.push({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.warn(`[reprocessarResumosOrfaos] Não foi possível listar: ${e.message}`);
+    return resultado;
+  }
+
+  resultado.total = orfaos.length;
+  if (orfaos.length === 0) {
+    console.log("[reprocessarResumosOrfaos] Nenhum órfão pra reprocessar.");
+    return resultado;
+  }
+
+  console.log(`[reprocessarResumosOrfaos] ${orfaos.length} órfão(s) encontrado(s). Tentando recuperar...`);
+
+  for (const orfao of orfaos) {
+    if (!orfao.chave || orfao.chave.length !== 44) {
+      // Chave inválida — remove e segue
+      try { await db.collection("sefaz_resumos").doc(orfao.id).delete(); } catch (_) {}
+      continue;
+    }
+    try {
+      const soapChave = buildSoapConsChNFe(orfao.chave, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
+      const resChave = await callSefazWithRetry(soapChave);
+      const resultChave = parseSefazResponse(resChave);
+
+      if (resultChave.cStat === "656") {
+        console.warn("[reprocessarResumosOrfaos] Rate limit durante reprocessamento. Parando.");
+        resultado.aindaFalhando += (orfaos.length - resultado.recuperadas - resultado.aindaFalhando);
+        break;
+      }
+
+      const nfeCompleta = resultChave.documentos.find(d => d.tipo === "nfe_completa");
+      if (nfeCompleta) {
+        const saved = await salvarNFeNoFirestore(nfeCompleta);
+        if (saved) {
+          resultado.recuperadas++;
+          resultado.detalhes.push({
+            numero: nfeCompleta.numero,
+            fornecedor: nfeCompleta.fornecedor,
+            valor: nfeCompleta.valor,
+            chave: orfao.chave,
+          });
+        }
+        // remove o órfão mesmo se já existia (limpa a coleção)
+        try { await db.collection("sefaz_resumos").doc(orfao.id).delete(); } catch (_) {}
+      } else {
+        resultado.aindaFalhando++;
+        console.warn(`[reprocessarResumosOrfaos] Chave ${orfao.chave} ainda não retornou NFe completa.`);
+      }
+
+      await sleep(CONFIG.RATE_LIMIT_MS);
+    } catch (e) {
+      resultado.aindaFalhando++;
+      console.warn(`[reprocessarResumosOrfaos] Erro em ${orfao.chave}: ${e.message}`);
+    }
+  }
+
+  console.log(`[reprocessarResumosOrfaos] Fim: ${resultado.recuperadas}/${resultado.total} recuperadas.`);
+  return resultado;
+}
+
+// ══════════════════════════════════════════════════════════
+//  FUNÇÃO INTERNA: executa a lógica de sincronização
+//  Reutilizada tanto pela Cloud Function onCall quanto pelo
+//  cron (scheduled function).
+// ══════════════════════════════════════════════════════════
+async function executarSincronizacaoSefaz(origem) {
+  const startTime = Date.now();
+  console.log(`[sincSefaz:${origem}] Iniciado`);
+
+  // ── FASE 0: reprocessa resumos órfãos antes de buscar NSUs novos ──
+  const reprocessamento = await reprocessarResumosOrfaos();
+
+  const configDoc = await db.collection("config").doc("sefaz_sync").get();
+  let ultNSU = configDoc.exists ? (configDoc.data().ultNSU || "0") : "0";
+
+  let totalDocs = 0, totalNFe = reprocessamento.recuperadas, totalResumos = 0, totalEventos = 0;
+  let iterations = 0, hasMore = true;
+  let rateLimited = false;
+  const nfesImportadas = [...reprocessamento.detalhes];
+
+  while (hasMore && iterations < CONFIG.MAX_ITERATIONS) {
+    iterations++;
+    const iterStart = Date.now();
+
+    const soapBody = buildSoapDistNSU(ultNSU, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
+    const response = await callSefazWithRetry(soapBody);
+    const result = parseSefazResponse(response);
+
+    console.log(`[sincSefaz:${origem}] Iter ${iterations} (${Date.now() - iterStart}ms): cStat=${result.cStat} | ${result.documentos.length} docs | ultNSU=${result.ultNSU}`);
+
+    if (result.cStat === "137") { hasMore = false; break; }
+    if (result.cStat === "656") {
+      console.warn(`[sincSefaz:${origem}] Rate limit SEFAZ (656). Parando.`);
+      rateLimited = true;
+      hasMore = false; break;
+    }
+    if (result.cStat !== "138") {
+      throw new Error(`SEFAZ retornou ${result.cStat}: ${result.xMotivo}`);
+    }
+
+    for (const doc of result.documentos) {
+      totalDocs++;
+      if (doc.tipo === "nfe_completa") {
+        const saved = await salvarNFeNoFirestore(doc);
+        totalNFe++;
+        if (saved) nfesImportadas.push({ numero: doc.numero, fornecedor: doc.fornecedor, valor: doc.valor, emissao: doc.emissao });
+      } else if (doc.tipo === "resumo") {
+        totalResumos++;
+        if (doc.situacao === "1" && doc.chave) {
+          try {
+            const soapChave = buildSoapConsChNFe(doc.chave, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
+            const resChave = await callSefazWithRetry(soapChave);
+            const resultChave = parseSefazResponse(resChave);
+            for (const d of resultChave.documentos) {
+              if (d.tipo === "nfe_completa") {
+                const saved = await salvarNFeNoFirestore(d);
+                totalNFe++;
+                if (saved) nfesImportadas.push({ numero: d.numero, fornecedor: d.fornecedor, valor: d.valor, emissao: d.emissao });
+              }
+            }
+            await sleep(CONFIG.RATE_LIMIT_MS);
+          } catch (e) {
+            console.warn(`[sincSefaz:${origem}] Erro ao buscar NF-e chave ${doc.chave}: ${e.message}`);
+            await salvarResumoNoFirestore(doc);
+          }
+        }
+      } else if (doc.tipo === "evento") {
+        totalEventos++;
+      }
+    }
+
+    ultNSU = result.ultNSU;
+    hasMore = parseInt(result.ultNSU) < parseInt(result.maxNSU);
+    if (hasMore) await sleep(CONFIG.RATE_LIMIT_MS);
+  }
+
+  // Conta resumos órfãos que ficaram pendentes
+  let resumosOrfaosFinal = 0;
+  try {
+    const snap = await db.collection("sefaz_resumos").get();
+    resumosOrfaosFinal = snap.size;
+  } catch (_) {}
+
+  const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
+  const agora = new Date().toISOString();
+
+  await db.collection("config").doc("sefaz_sync").set({
+    ultNSU, ultimaSincronizacao: agora, totalDocsSincronizados: totalDocs,
+    ultimaOrigem: origem,
+    ultimoResultado: {
+      totalDocs, totalNFe, totalResumos, totalEventos,
+      iteracoes: iterations, hasMore, rateLimited, duracaoSegundos: duracao,
+      orfaosReprocessados: reprocessamento.recuperadas,
+      orfaosTotal: reprocessamento.total,
+      resumosOrfaosPendentes: resumosOrfaosFinal,
+      nfesImportadas: nfesImportadas.slice(0, 20),
+      executadoEm: agora,
+    }
+  }, { merge: true });
+
+  console.log(`[sincSefaz:${origem}] Concluído em ${duracao}s: ${totalNFe} NFe (+${reprocessamento.recuperadas} órfãs recuperadas)`);
+
+  return {
+    success: true, ultNSU, totalDocs, totalNFe, totalResumos, totalEventos,
+    iteracoes: iterations, hasMore, rateLimited, duracaoSegundos: duracao,
+    orfaosReprocessados: reprocessamento.recuperadas,
+    orfaosTotal: reprocessamento.total,
+    resumosOrfaosPendentes: resumosOrfaosFinal,
+    nfesImportadas: nfesImportadas.slice(0, 20),
+    msg: totalNFe > 0
+      ? `✅ ${totalNFe} NF-e importada(s)${reprocessamento.recuperadas > 0 ? ` (${reprocessamento.recuperadas} recuperada(s) de órfãs)` : ""} em ${duracao}s!`
+      : `Nenhuma NF-e nova encontrada. (${totalDocs} docs processados em ${duracao}s)`,
+  };
+}
+
+// ══════════════════════════════════════════════════════════
+//  CLOUD FUNCTION: sincronizarSefaz (onCall pelo frontend)
 // ══════════════════════════════════════════════════════════
 exports.sincronizarSefaz = functions
-  .runWith({ timeoutSeconds: 120, memory: "512MB" })
+  .runWith({ timeoutSeconds: 540, memory: "512MB" })
+  .https.onCall(async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Usuário não autenticado.");
+    }
+    try {
+      return await executarSincronizacaoSefaz(`manual:${context.auth.uid}`);
+    } catch (error) {
+      console.error(`[sincronizarSefaz] ERRO:`, error);
+      throw new functions.https.HttpsError("internal", error.message);
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  CLOUD FUNCTION: sincronizarSefazAgendado (cron 2x/dia)
+//  Executa automaticamente às 07:00 e 19:00 (America/Sao_Paulo)
+// ══════════════════════════════════════════════════════════
+exports.sincronizarSefazAgendado = functions
+  .runWith({ timeoutSeconds: 540, memory: "512MB" })
+  .pubsub.schedule("0 7,19 * * *")
+  .timeZone("America/Sao_Paulo")
+  .onRun(async (context) => {
+    try {
+      const res = await executarSincronizacaoSefaz("cron");
+      console.log(`[cron] Sync OK: ${JSON.stringify({
+        totalNFe: res.totalNFe,
+        orfaosRecuperados: res.orfaosReprocessados,
+        duracao: res.duracaoSegundos,
+      })}`);
+      return null;
+    } catch (error) {
+      console.error(`[cron] ERRO na sincronização agendada:`, error);
+      // registra o erro no Firestore pra aparecer no dashboard
+      try {
+        await db.collection("config").doc("sefaz_sync").set({
+          ultimoErroAgendado: {
+            mensagem: error.message || String(error),
+            ocorridoEm: new Date().toISOString(),
+          }
+        }, { merge: true });
+      } catch (_) {}
+      return null;
+    }
+  });
+
+// ══════════════════════════════════════════════════════════
+//  CLOUD FUNCTION: buscarNFePorChave
+//  Busca uma NF-e específica pela chave de 44 dígitos,
+//  ignorando o controle de NSU. Útil para notas que foram
+//  perdidas na sincronização normal ou ficaram como "resumo".
+// ══════════════════════════════════════════════════════════
+exports.buscarNFePorChave = functions
+  .runWith({ timeoutSeconds: 60, memory: "512MB" })
   .https.onCall(async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Usuário não autenticado.");
     }
 
     const startTime = Date.now();
-    console.log(`[sincronizarSefaz] Iniciado por ${context.auth.uid}`);
+    let { chave } = data || {};
+    if (!chave) {
+      throw new functions.https.HttpsError("invalid-argument", "Chave da NF-e é obrigatória.");
+    }
+
+    // Sanitiza: remove espaços, pontos, traços e qualquer não-dígito
+    chave = String(chave).replace(/\D/g, "");
+    if (chave.length !== 44) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `Chave deve ter exatamente 44 dígitos. Recebido: ${chave.length} dígitos.`
+      );
+    }
+
+    console.log(`[buscarNFePorChave] ${context.auth.uid} buscando chave ${chave}`);
 
     try {
-      const configDoc = await db.collection("config").doc("sefaz_sync").get();
-      let ultNSU = configDoc.exists ? (configDoc.data().ultNSU || "0") : "0";
-
-      let totalDocs = 0, totalNFe = 0, totalResumos = 0, totalEventos = 0;
-      let iterations = 0, hasMore = true;
-      const nfesImportadas = [];
-
-      while (hasMore && iterations < CONFIG.MAX_ITERATIONS) {
-        iterations++;
-        const iterStart = Date.now();
-
-        const soapBody = buildSoapDistNSU(ultNSU, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
-        const response = await callSefazWithRetry(soapBody);
-        const result = parseSefazResponse(response);
-
-        console.log(`[sincronizarSefaz] Iter ${iterations} (${Date.now() - iterStart}ms): cStat=${result.cStat} | ${result.documentos.length} docs | ultNSU=${result.ultNSU}`);
-
-        if (result.cStat === "137") { hasMore = false; break; }
-        if (result.cStat === "656") {
-          console.warn("[sincronizarSefaz] Rate limit SEFAZ (656). Parando.");
-          hasMore = false; break;
+      // 1) Verifica se já existe nas NF-e completas (evita duplicação)
+      const existingDoc = await db.collection("dados").doc("notas_fiscais").get();
+      let nfeItems = [];
+      if (existingDoc.exists) {
+        const d = existingDoc.data();
+        if (d._chunked) {
+          const chunks = await db.collection("dados")
+            .where("_parentKey", "==", "notas_fiscais").orderBy("_chunkIndex").get();
+          chunks.forEach(c => { try { nfeItems = nfeItems.concat(JSON.parse(c.data().valor)); } catch (_e) {} });
+        } else if (d.valor) {
+          try { nfeItems = JSON.parse(d.valor); } catch (_e) { nfeItems = []; }
         }
-        if (result.cStat !== "138") {
-          throw new Error(`SEFAZ retornou ${result.cStat}: ${result.xMotivo}`);
-        }
+      }
+      const jaExiste = nfeItems.some(n => n.chave === chave);
 
-        for (const doc of result.documentos) {
-          totalDocs++;
-          if (doc.tipo === "nfe_completa") {
-            const saved = await salvarNFeNoFirestore(doc);
-            totalNFe++;
-            if (saved) nfesImportadas.push({ numero: doc.numero, fornecedor: doc.fornecedor, valor: doc.valor, emissao: doc.emissao });
-          } else if (doc.tipo === "resumo") {
-            totalResumos++;
-            if (doc.situacao === "1" && doc.chave) {
-              try {
-                const soapChave = buildSoapConsChNFe(doc.chave, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
-                const resChave = await callSefazWithRetry(soapChave);
-                const resultChave = parseSefazResponse(resChave);
-                for (const d of resultChave.documentos) {
-                  if (d.tipo === "nfe_completa") {
-                    const saved = await salvarNFeNoFirestore(d);
-                    totalNFe++;
-                    if (saved) nfesImportadas.push({ numero: d.numero, fornecedor: d.fornecedor, valor: d.valor, emissao: d.emissao });
-                  }
-                }
-                await sleep(CONFIG.RATE_LIMIT_MS);
-              } catch (e) {
-                console.warn(`Erro ao buscar NF-e chave ${doc.chave}:`, e.message);
-                await salvarResumoNoFirestore(doc);
-              }
-            }
-          } else if (doc.tipo === "evento") {
-            totalEventos++;
-          }
-        }
+      // 2) Consulta SEFAZ via consChNFe
+      const soapBody = buildSoapConsChNFe(chave, CONFIG.CNPJ, CONFIG.UF_CODIGO, CONFIG.AMBIENTE);
+      const response = await callSefazWithRetry(soapBody);
+      const result = parseSefazResponse(response);
 
-        ultNSU = result.ultNSU;
-        hasMore = parseInt(result.ultNSU) < parseInt(result.maxNSU);
-        if (hasMore) await sleep(CONFIG.RATE_LIMIT_MS);
+      console.log(`[buscarNFePorChave] SEFAZ cStat=${result.cStat} | xMotivo=${result.xMotivo} | ${result.documentos.length} docs`);
+
+      // 3) Trata códigos de retorno da SEFAZ
+      if (result.cStat === "137") {
+        return {
+          success: false,
+          jaExistia: jaExiste,
+          msg: "⚠️ Nada encontrado na SEFAZ para essa chave. Confirme se a chave está correta e se a NF-e está autorizada.",
+          cStat: result.cStat, xMotivo: result.xMotivo,
+        };
+      }
+      if (result.cStat === "656") {
+        throw new functions.https.HttpsError("resource-exhausted",
+          "SEFAZ atingiu o limite de consultas. Aguarde alguns minutos e tente novamente.");
+      }
+      if (result.cStat !== "138") {
+        throw new functions.https.HttpsError("unavailable",
+          `SEFAZ retornou ${result.cStat}: ${result.xMotivo}`);
       }
 
-      await db.collection("config").doc("sefaz_sync").set({
-        ultNSU, ultimaSincronizacao: new Date().toISOString(), totalDocsSincronizados: totalDocs,
-      }, { merge: true });
+      // 4) Procura NF-e completa no resultado
+      const nfeCompleta = result.documentos.find(d => d.tipo === "nfe_completa");
+      if (!nfeCompleta) {
+        return {
+          success: false,
+          jaExistia: jaExiste,
+          msg: "⚠️ SEFAZ retornou a consulta mas o XML completo não veio. Pode ser caso de NF-e denegada, cancelada ou muito antiga. Tente usar 'Importar XML' manualmente.",
+          documentosRetornados: result.documentos.length,
+          tiposRetornados: result.documentos.map(d => d.tipo),
+        };
+      }
+
+      if (jaExiste) {
+        const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
+        return {
+          success: true, jaExistia: true, importada: false,
+          msg: `ℹ️ NF-e ${nfeCompleta.numero} já estava importada no sistema.`,
+          numero: nfeCompleta.numero, fornecedor: nfeCompleta.fornecedor, valor: nfeCompleta.valor,
+          duracaoSegundos: duracao,
+        };
+      }
+
+      // 5) Salva no Firestore (reusa a função de sempre)
+      const saved = await salvarNFeNoFirestore(nfeCompleta);
+
+      // 6) Remove possível "resumo" pendurado da mesma chave (limpa inconsistência)
+      try {
+        const resumoRef = db.collection("sefaz_resumos").doc(chave);
+        const resumoSnap = await resumoRef.get();
+        if (resumoSnap.exists) {
+          await resumoRef.delete();
+          console.log(`[buscarNFePorChave] Resumo antigo da chave ${chave} removido.`);
+        }
+      } catch (e) {
+        console.warn(`[buscarNFePorChave] Não foi possível limpar resumo antigo: ${e.message}`);
+      }
 
       const duracao = ((Date.now() - startTime) / 1000).toFixed(1);
-      const resultado = {
-        success: true, ultNSU, totalDocs, totalNFe, totalResumos, totalEventos,
-        iteracoes: iterations, hasMore, duracaoSegundos: duracao,
-        nfesImportadas: nfesImportadas.slice(0, 20),
-        msg: totalNFe > 0
-          ? `✅ ${totalNFe} NF-e(s) importada(s) da SEFAZ em ${duracao}s!`
-          : `Nenhuma NF-e nova encontrada. (${totalDocs} docs processados em ${duracao}s)`,
+      return {
+        success: true, jaExistia: false, importada: !!saved,
+        msg: `✅ NF-e ${nfeCompleta.numero} de ${nfeCompleta.fornecedor} importada em ${duracao}s!`,
+        numero: nfeCompleta.numero, serie: nfeCompleta.serie, emissao: nfeCompleta.emissao,
+        fornecedor: nfeCompleta.fornecedor, cnpj: nfeCompleta.cnpj, valor: nfeCompleta.valor,
+        duracaoSegundos: duracao,
       };
-      console.log(`[sincronizarSefaz] Concluído em ${duracao}s`);
-      return resultado;
 
     } catch (error) {
-      console.error(`[sincronizarSefaz] ERRO:`, error);
+      console.error(`[buscarNFePorChave] ERRO:`, error);
+      if (error instanceof functions.https.HttpsError) throw error;
       throw new functions.https.HttpsError("internal", error.message);
     }
   });
