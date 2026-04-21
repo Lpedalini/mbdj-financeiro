@@ -6711,7 +6711,7 @@ async function renderSefazSyncDashboard() {
 
     var orfaosMsg = '';
     if(r.resumosOrfaosPendentes && r.resumosOrfaosPendentes > 0) {
-      orfaosMsg = '<div style="margin-top:6px;padding:6px 10px;background:#fff3cd;border-left:3px solid #ffc107;border-radius:3px;font-size:11px;color:#856404;">⚠️ '+r.resumosOrfaosPendentes+' nota(s) em estado intermediário — serão retomadas na próxima sync.</div>';
+      orfaosMsg = '<div style="margin-top:6px;padding:6px 10px;background:#fff3cd;border-left:3px solid #ffc107;border-radius:3px;font-size:11px;color:#856404;">⚠️ '+r.resumosOrfaosPendentes+' nota(s) em estado intermediário — use "🔍 Buscar por chave" para importar individualmente.</div>';
     }
     var orfaosRecuperadosMsg = '';
     if(r.orfaosReprocessados && r.orfaosReprocessados > 0) {
@@ -6720,6 +6720,19 @@ async function renderSefazSyncDashboard() {
     var rateLimitMsg = '';
     if(r.rateLimited) {
       rateLimitMsg = '<div style="margin-top:6px;padding:6px 10px;background:#fff3cd;border-left:3px solid #ffc107;border-radius:3px;font-size:11px;color:#856404;">⚠️ Última sync parou por limite de consultas da SEFAZ. Próxima rodada vai continuar de onde parou.</div>';
+    }
+    // Modo catch-up: destaque especial
+    var catchUpMsg = '';
+    if(r.modoCatchUp) {
+      if(r.gapFinal && r.gapFinal > 0) {
+        catchUpMsg = '<div style="margin-top:6px;padding:8px 12px;background:#e7f3ff;border-left:4px solid #1a5276;border-radius:3px;font-size:12px;color:#0c3a5c;">'
+          + '<strong>🚀 Modo Catch-up ativo</strong><br>'
+          + 'Recuperando histórico acumulado. Ainda faltam <strong>~'+r.gapFinal+' NSUs</strong> '
+          + '(estimativa: <strong>~'+(r.execucoesRestantesEstimadas||1)+' execução(ões)</strong> do botão SINCRONIZAR).'
+          + '</div>';
+      } else {
+        catchUpMsg = '<div style="margin-top:6px;padding:6px 10px;background:#d4edda;border-left:3px solid #28a745;border-radius:3px;font-size:11px;color:#155724;">✅ Catch-up concluído! Próxima sync já será em modo normal.</div>';
+      }
     }
     var erroMsg = '';
     if(erroAg) {
@@ -6741,7 +6754,7 @@ async function renderSefazSyncDashboard() {
       +     '<div style="font-size:12px;"><strong>'+totalNFe+'</strong> NFe · '+duracao+'s'+orfaosRecuperadosMsg+'</div>'
       +   '</div>'
       + '</div>'
-      + orfaosMsg + rateLimitMsg + erroMsg
+      + orfaosMsg + catchUpMsg + rateLimitMsg + erroMsg
       + '<div style="margin-top:6px;font-size:10px;color:#999;">🤖 Sincronização automática rodando 2x ao dia (7h e 19h). Você pode forçar manual clicando no botão abaixo.</div>'
       + '</div>';
 
@@ -6889,7 +6902,7 @@ async function sincronizarSefaz() {
       return;
     }
 
-    showToast('🔄 Conectando à SEFAZ... Isso pode levar até 1 minuto.');
+    showToast('🔄 Conectando à SEFAZ... Isso pode levar até 2 minutos.');
 
     // Chamar Cloud Function
     var result = await fns.sincronizar();
@@ -6897,6 +6910,12 @@ async function sincronizarSefaz() {
 
     if(data.success) {
       showToast(data.msg);
+
+      // Modo catch-up com ainda NSU a drenar: destaca com alerta pro usuário clicar de novo
+      if(data.modoCatchUp && data.gapFinal > 0) {
+        showToast('🚀 Restam ~' + data.gapFinal + ' NSUs. Clique SINCRONIZAR novamente para continuar drenando.', false);
+        if(btn) { btn.innerHTML = '🔄 SINCRONIZAR (continua)'; }
+      }
 
       // Se importou NF-e novas, recarregar dados do Firestore e atualizar tela
       if(data.totalNFe > 0) {
@@ -6919,10 +6938,15 @@ async function sincronizarSefaz() {
       msg = 'Certificado A1 não configurado. Vá em Config SEFAZ para fazer upload.';
     } else if(msg.includes('unauthenticated')) {
       msg = 'Sessão expirada. Faça login novamente.';
+    } else if(msg.includes('deadline-exceeded') || msg.toLowerCase().includes('deadline')) {
+      msg = 'A sincronização demorou mais de 9 minutos. Isso acontece quando há muito atraso. Clique SINCRONIZAR novamente — a próxima execução continua de onde parou.';
     }
     showToast('❌ ' + msg, true);
   } finally {
-    if(btn) { btn.disabled = false; btn.innerHTML = '🔄 SINCRONIZAR SEFAZ'; }
+    if(btn) {
+      btn.disabled = false;
+      if(btn.innerHTML.indexOf('continua') === -1) btn.innerHTML = '🔄 SINCRONIZAR SEFAZ';
+    }
   }
 }
 
